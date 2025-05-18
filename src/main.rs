@@ -1,15 +1,17 @@
 use anyhow::Result;
 use aws_config::BehaviorVersion;
 use aws_sdk_verifiedpermissions::Client as VerifiedPermissionsClient;
+use aws_sdk_verifiedpermissions::types::Decision;
 use aws_types::region::Region;
 use cedar_local_agent::public::simple::{Authorizer, AuthorizerConfigBuilder};
-use cedar_policy::{Request as CedarRequest, Decision, Schema};
+use cedar_policy::{Request as CedarRequest, Schema};
 use cedar_policy::{Entities, EntityUid, Context};
 use avp_local_agent::public::{
     entity_provider::EntityProvider,
     policy_set_provider::PolicySetProvider,
 };
 use clap::Parser;
+use custom_types::{CedarResponse, CedarDiagnostics}; 
 use envoy_types::ext_authz::v3::CheckResponseExt;
 use envoy_types::ext_authz::v3::pb::{
     Authorization, AuthorizationServer, CheckRequest, CheckResponse,
@@ -32,11 +34,14 @@ mod auth_cache;
 mod resource_mapper;
 mod telemetry;
 mod health;
+mod custom_types;
 
 use jwt::{JwtValidator, JwtError, Claims};
 use auth_cache::AuthorizationCache;
 use resource_mapper::{ResourceMapper, create_default_resource_mapper};
 use telemetry::Telemetry;
+
+use crate::resource_mapper::ResourcePath;
 
 // Policy refresh channel for background refresh
 type PolicyRefreshSender = mpsc::Sender<()>;
@@ -126,6 +131,10 @@ struct Args {
     /// Enable metrics server (default port: 9000)
     #[arg(long)]
     enable_metrics: bool,
+
+    /// Enable local policy evaluation for high performance (requires local-evaluation feature)
+    #[arg(long)]
+    local_evaluation: bool,
 }
 
 // Configuration for resource mapping
@@ -153,11 +162,19 @@ struct ActionMapping {
 
 // Our authorization service implementation
 struct AvpAuthorizationService {
-    authorizer: Arc<RwLock<Authorizer<PolicySetProvider, EntityProvider>>>,
-    jwt_validator: JwtValidator, 
+    // Common fields for both approaches
+    jwt_validator: JwtValidator,
     auth_cache: Arc<AuthorizationCache>,
+    policy_store_id: String,
+    avp_client: VerifiedPermissionsClient,
+    
+    // Fields used only with local evaluation
+    authorizer: Option<Arc<RwLock<Authorizer<PolicySetProvider, EntityProvider>>>>,
     schema: Option<Schema>,
-    policy_refresh_sender: PolicyRefreshSender,
+    policy_refresh_sender: Option<PolicyRefreshSender>,
+    
+    // Flag to determine evaluation mode (always accessible)
+    use_local_evaluation: bool,
 }
 
 impl AvpAuthorizationService {
@@ -171,8 +188,8 @@ impl AvpAuthorizationService {
         policy_cache_ttl: Duration,
         policy_cache_size: usize,
         schema_path: Option<String>,
-    ) -> Result<(Self, PolicyRefreshReceiver)> {
-        // Set up AWS SDK configuration with retry and timeout settings
+        use_local_evaluation: bool,
+    ) -> Result<(Self, Option<PolicyRefreshReceiver>)> {
         let aws_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
             .region(Region::new(region))
             .retry_config(aws_config::retry::RetryConfig::standard()
@@ -188,63 +205,8 @@ impl AvpAuthorizationService {
             
         // Create the Amazon Verified Permissions client
         let avp_client = VerifiedPermissionsClient::new(&aws_config);
-        
-        // Load schema if provided
-        let schema: Option<Schema> = if let Some(path) = schema_path {
-            info!("Loading Cedar schema from {}", path);
-            match fs::read_to_string(&path) {
-                Ok(schema_str) => {
-                    match Schema::from_json_str(&schema_str) {
-                        Ok(schema) => {
-                            info!("Successfully loaded Cedar schema");
-                            Some(schema)
-                        },
-                        Err(e) => {
-                            error!("Failed to parse Cedar schema: {}", e);
-                            None
-                        }
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to read schema file {}: {}", path, e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        
-        // Create policy provider from Amazon Verified Permissions
-        let policy_set_provider = PolicySetProvider::from_client(
-            policy_store_id.clone(), 
-            avp_client.clone()
-        )?;
-        
-        // Create entity provider from Amazon Verified Permissions
-        let entity_provider = EntityProvider::from_client(
-            policy_store_id, 
-            avp_client
-        )?;
-        
-        // Create the authorizer configuration with the schema if available
-        let config = if let Some(_schema) = &schema {
-            AuthorizerConfigBuilder::default()
-                .policy_set_provider(Arc::new(policy_set_provider))
-                .entity_provider(Arc::new(entity_provider))
-                .build()
-                .unwrap()
-        } else {
-            AuthorizerConfigBuilder::default()
-                .policy_set_provider(Arc::new(policy_set_provider))
-                .entity_provider(Arc::new(entity_provider))
-                .build()
-                .unwrap()
-        };
-        
-        // Create the authorizer with the configuration
-        let authorizer = Authorizer::new(config);
-        
-        // Create the JWT validator with JWKS support
+
+        // Create the JWT validator
         let jwt_validator = JwtValidator::new(
             jwks_url.to_string(), 
             jwt_issuer, 
@@ -258,17 +220,543 @@ impl AvpAuthorizationService {
             policy_cache_ttl,
             policy_cache_size,
         ));
-        
-        // Create policy refresh channel
-        let (tx, rx) = mpsc::channel::<()>(1);
 
-        Ok((Self {
-            authorizer: Arc::new(RwLock::new(authorizer)),
-            jwt_validator,
-            auth_cache,
-            schema,
-            policy_refresh_sender: tx,
-        }, rx))
+        {
+            // Only set up local evaluation components if the feature is enabled and the flag is set
+            if use_local_evaluation {
+                info!("Using local policy evaluation");
+                let (policy_refresh_sender, policy_refresh_rx) = mpsc::channel::<()>(1);
+                
+                // Load schema if provided
+                let schema: Option<Schema> = if let Some(path) = schema_path {
+                    info!("Loading Cedar schema from {}", path);
+                    match fs::read_to_string(&path) {
+                        Ok(schema_str) => {
+                            match Schema::from_json_str(&schema_str) {
+                                Ok(schema) => {
+                                    info!("Successfully loaded Cedar schema");
+                                    Some(schema)
+                                },
+                                Err(e) => {
+                                    error!("Failed to parse Cedar schema: {}", e);
+                                    None
+                                }
+                            }
+                        },
+                        Err(e) => {
+                            error!("Failed to read schema file {}: {}", path, e);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                // Create policy provider from Amazon Verified Permissions
+                let policy_set_provider = PolicySetProvider::from_client(
+                    policy_store_id.clone(), 
+                    avp_client.clone()
+                )?;
+                
+                // Create entity provider from Amazon Verified Permissions
+                let entity_provider = EntityProvider::from_client(
+                    policy_store_id.clone(), 
+                    avp_client.clone()
+                )?;
+
+                // Create the authorizer configuration
+                let config = if let Some(_schema) = &schema {
+                    AuthorizerConfigBuilder::default()
+                        .policy_set_provider(Arc::new(policy_set_provider))
+                        .entity_provider(Arc::new(entity_provider))
+                        .build()
+                        .unwrap()
+                } else {
+                    AuthorizerConfigBuilder::default()
+                        .policy_set_provider(Arc::new(policy_set_provider))
+                        .entity_provider(Arc::new(entity_provider))
+                        .build()
+                        .unwrap()
+                };
+        
+                // Create the authorizer
+                let authorizer = Authorizer::new(config);
+        
+                return Ok((Self {
+                    jwt_validator,
+                    auth_cache,
+                    policy_store_id,
+                    avp_client,
+                    authorizer: Some(Arc::new(RwLock::new(authorizer))),
+                    schema,
+                    policy_refresh_sender: Some(policy_refresh_sender),
+                    use_local_evaluation: true,
+                }, Some(policy_refresh_rx)));
+            } else {
+                // Local evaluation feature available but not enabled
+                info!("Using AVP API for authorization");
+                return Ok((Self {
+                    jwt_validator,
+                    auth_cache,
+                    policy_store_id,
+                    avp_client,
+                    authorizer: None::<Arc<RwLock<Authorizer<PolicySetProvider, EntityProvider>>>>,
+                    schema: None,
+                    policy_refresh_sender: None,
+                    use_local_evaluation: false,
+                }, None));
+            }
+        }
+    }
+
+    // AVP API based check
+    async fn check_with_avp_api(
+        &self,
+        token: &str,
+        claims: &Claims,
+        method: &str,
+        path: &str,
+        resource_info: &ResourcePath,
+        action: String,
+        query_params: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
+    ) -> Result<Response<CheckResponse>, Status> {
+        debug!("Using AVP API for authorization check");
+        
+        // Extract the action ID (e.g., "read" from "Action::\"read\"")
+        let action_id = action.trim_start_matches("Action::\"").trim_end_matches("\"");
+        
+        // Get the resource entity ID from resource info
+        let resource_entity_id = resource_info.to_entity_uid();
+        let resource_entity_type = if resource_info.resource_id.is_some() {
+            resource_info.resource_type.clone()
+        } else {
+            format!("{}Collection", resource_info.resource_type)
+        };
+        
+        // Create context from request information
+        let context_pairs = self.create_context_map(method, path, query_params, headers, resource_info, claims);
+        
+        // Convert to AVP context format
+        let avp_context = match serde_json::to_string(&context_pairs) {
+            Ok(json_str) => {
+                aws_sdk_verifiedpermissions::types::ContextDefinition::CedarJson(json_str)
+            },
+            Err(e) => {
+                warn!("Failed to serialize context to JSON: {}", e);
+                aws_sdk_verifiedpermissions::types::ContextDefinition::CedarJson("{}".to_string())
+            }
+        };
+        
+        // Compute cache key for potential caching
+        let context_hash = AuthorizationCache::compute_context_hash(&format!("{:?}", context_pairs));
+        let principal_id = claims.sub.clone();
+        let principal = format!("User::\"{principal_id}\"");
+        let principal_entity = principal.parse::<cedar_policy::EntityUid>()
+            .unwrap_or_else(|_| "User::\"unknown\"".parse().unwrap());
+        let action_entity = action.parse::<cedar_policy::EntityUid>()
+            .unwrap_or_else(|_| "Action::\"unknown\"".parse().unwrap());
+        let resource_entity = format!("Resource::\"{}\"", resource_entity_id)
+            .parse::<cedar_policy::EntityUid>()
+            .unwrap_or_else(|_| "Resource::\"unknown\"".parse().unwrap());
+                
+        // Try to get result from cache first
+        if let Some((cached_decision, diagnostics)) = self.auth_cache.get(
+            &principal_entity, 
+            &action_entity, 
+            &resource_entity, 
+            context_hash
+        ).await {
+            Telemetry::record_cache_hit();
+            debug!("Using cached authorization decision: {:?}", cached_decision);
+            
+            // Return the cached decision
+            if cached_decision == cedar_policy::Decision::Allow {
+                info!("Authorization allowed (cached): principal={}, action={}, resource={}", 
+                    principal, action, resource_entity_id);
+                
+                Ok(Response::new(CheckResponse::with_status(
+                    Status::ok("Request authorized"),
+                )))
+            } else {
+                warn!("Authorization denied (cached): principal={}, action={}, resource={}", 
+                    principal, action, resource_entity_id);
+                
+                // Include diagnostics if available
+                let message = if let Some(diag) = diagnostics {
+                    format!("Request not authorized: {}", diag)
+                } else {
+                    "Request not authorized".to_string()
+                };
+                
+                Ok(Response::new(CheckResponse::with_status(
+                    Status::permission_denied(message),
+                )))
+            }
+        } else {
+            Telemetry::record_cache_miss();
+            
+        // Get the resource entity ID from resource info
+        let resource_entity_id = resource_info.to_entity_uid();
+
+        // Call AVP's IsAuthorizedWithToken API
+        let eval_timer = Telemetry::time_cedar_evaluation();
+
+        let auth_result = self.avp_client
+            .is_authorized_with_token()
+            .policy_store_id(&self.policy_store_id)
+            .identity_token(token)
+            .action(aws_sdk_verifiedpermissions::types::ActionIdentifier::builder()
+                .action_id(action_id)
+                .action_type("Action")
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build action identifier: {}", e);
+                    Status::internal("Failed to build action identifier")
+                })?)
+            .resource(aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
+                .entity_id(resource_entity_id.clone()) // Clone here
+                .entity_type(resource_entity_type)
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build entity identifier: {}", e);
+                    Status::internal("Failed to build entity identifier")
+                })?)
+            .context(avp_context)
+            .send()
+            .await
+            .map_err(|e| {
+                error!("AVP authorization error: {}", e);
+                Status::internal("Authorization service error")
+            })?;
+            
+            // End the evaluation timer
+            drop(eval_timer);
+                
+                // // Create a CedarResponse object that combines the decision and diagnostics
+                // let cedar_decision = if *auth_result.decision() == Decision::Allow {
+                //     cedar_policy::Decision::Allow
+                // } else {
+                //     cedar_policy::Decision::Deny
+                // };
+            
+            // Extract any errors for diagnostics
+            let errors_vec: Vec<String> = auth_result.errors().iter()
+                .map(|e| {
+                    if let desc = e.error_description() {
+                        desc.to_string()
+                    } else {
+                        "Unknown error".to_string()
+                    }
+                })
+                .collect();
+
+            let diagnostics = if !errors_vec.is_empty() {
+                Some(errors_vec.join("; "))
+            } else {
+                None
+            };
+            
+            // Create a CedarResponse for caching
+            let cedar_response = CedarResponse::new(
+                auth_result.decision().clone(), 
+                CedarDiagnostics::with_errors(errors_vec)
+            );
+
+            // Cache the result
+            self.auth_cache.put_aws(
+                &principal_entity,
+                &action_entity,
+                &resource_entity,
+                context_hash,
+                auth_result.decision().clone(),
+                diagnostics.clone()
+            ).await;
+            
+            // Return the appropriate response
+            if *auth_result.decision() == Decision::Allow {
+                info!("Authorization allowed: principal={}, action={}, resource={}", 
+                    principal, action, resource_entity_id);
+                
+                // Record the metric
+                Telemetry::record_request(method, path, "allowed");
+                
+                Ok(Response::new(CheckResponse::with_status(
+                    Status::ok("Request authorized"),
+                )))
+            } else {
+                warn!("Authorization denied: principal={}, action={}, resource={}", 
+                    principal, action, resource_entity_id);
+                
+                // Record the metric
+                Telemetry::record_request(method, path, "denied");
+                
+                // Get diagnostics for better error messages
+                let message = if let Some(diag) = diagnostics {
+                    format!("Request not authorized: {}", diag)
+                } else {
+                    "Request not authorized".to_string()
+                };
+                
+                Ok(Response::new(CheckResponse::with_status(
+                    Status::permission_denied(message),
+                )))
+            }
+        }
+    }
+    
+    // Helper method to create context map for both implementations
+    fn create_context_map(
+        &self,
+        method: &str,
+        path: &str,
+        query_params: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
+        resource_info: &ResourcePath, 
+        claims: &Claims,
+    ) -> HashMap<String, serde_json::Value> {
+        // Create a simple HashMap for context
+        let mut context_pairs = HashMap::new();
+        
+        // Add basic request information
+        context_pairs.insert("http_method".to_string(), serde_json::Value::String(method.to_string()));
+        context_pairs.insert("http_path".to_string(), serde_json::Value::String(path.to_string()));
+        
+        // Add query parameters with prefix
+        for (k, v) in query_params {
+            context_pairs.insert(
+                format!("query_{}", k), 
+                serde_json::Value::String(v.clone())
+            );
+        }
+        
+        // Add selected headers
+        for (k, v) in headers {
+            context_pairs.insert(
+                format!("header_{}", k.replace('-', "_")), 
+                serde_json::Value::String(v.clone())
+            );
+        }
+        
+        // Add resource information
+        context_pairs.insert(
+            "resource_type".to_string(), 
+            serde_json::Value::String(resource_info.resource_type.clone())
+        );
+        
+        if let Some(ref id) = resource_info.resource_id {
+            context_pairs.insert(
+                "resource_id".to_string(), 
+                serde_json::Value::String(id.clone())
+            );
+        }
+        
+        if let Some(ref parent_type) = resource_info.parent_type {
+            context_pairs.insert(
+                "parent_type".to_string(), 
+                serde_json::Value::String(parent_type.clone())
+            );
+        }
+        
+        if let Some(ref parent_id) = resource_info.parent_id {
+            context_pairs.insert(
+                "parent_id".to_string(), 
+                serde_json::Value::String(parent_id.clone())
+            );
+        }
+        
+        // Add resource parameters
+        for (k, v) in &resource_info.parameters {
+            context_pairs.insert(
+                format!("param_{}", k), 
+                serde_json::Value::String(v.clone())
+            );
+        }
+        
+        // Add JWT claims to context
+        for (k, v) in &claims.additional_claims {
+            context_pairs.insert(
+                format!("jwt_{}", k), 
+                v.clone()
+            );
+        }
+        
+        context_pairs
+    }
+    
+    async fn check_with_local_evaluation(
+        &self,
+        claims: &Claims,
+        method: &str,
+        path: &str,
+        resource_info: &ResourcePath,
+        action: String,
+        query_params: &HashMap<String, String>,
+        headers: &HashMap<String, String>,
+    ) -> Result<Response<CheckResponse>, Status> {
+        debug!("Using local policy evaluation");
+        
+        // Use the validated subject from JWT as principal ID
+        let principal_id = claims.sub.clone();
+        let principal = format!("User::\"{principal_id}\"");
+        let principal_entity: EntityUid = principal.parse().unwrap();
+        
+        // Parse action
+        let action_entity: EntityUid = action.parse().unwrap();
+        
+        // Get resource entity from path information
+        let resource = format!("Resource::\"{}\"", resource_info.to_entity_uid());
+        let resource_entity: EntityUid = resource.parse().unwrap();
+        
+        // Original context creation logic
+        let merged_context = {
+            // Create context map
+            let context_pairs = self.create_context_map(
+                method, path, query_params, headers, resource_info, claims
+            );
+            
+            // Convert to Cedar Context
+            match serde_json::to_string(&context_pairs) {
+                Ok(json_str) => match Context::from_json_str(&json_str, None) {
+                    Ok(context) => context,
+                    Err(e) => {
+                        debug!("Failed to create context from JSON: {}", e);
+                        Context::empty()
+                    }
+                },
+                Err(e) => {
+                    debug!("Failed to serialize context to JSON: {}", e);
+                    Context::empty()
+                }
+            }
+        };
+        
+        // Compute context hash for cache key
+        let context_hash = AuthorizationCache::compute_context_hash(&format!("{:?}", merged_context));
+
+        debug!("Checking authorization: principal={}, action={}, resource={}", 
+            principal, action, resource);
+
+        // Try to get result from cache first
+        if let Some((decision, diagnostics)) = self.auth_cache.get(
+            &principal_entity, 
+            &action_entity, 
+            &resource_entity, 
+            context_hash
+        ).await {
+            Telemetry::record_cache_hit();
+            
+            debug!("Using cached authorization decision: {:?}", decision);
+            
+            // Return the cached decision
+            return if matches!(decision, cedar_policy::Decision::Allow) {
+                info!("Authorization allowed (cached): principal={}, action={}, resource={}", 
+                    principal, action, resource);
+                
+                Ok(Response::new(CheckResponse::with_status(
+                    Status::ok("Request authorized"),
+                )))
+            } else {
+                warn!("Authorization denied (cached): principal={}, action={}, resource={}", 
+                    principal, action, resource);
+                
+                // Include diagnostics if available
+                let message = if let Some(diag) = diagnostics {
+                    format!("Request not authorized: {}", diag)
+                } else {
+                    "Request not authorized".to_string()
+                };
+                
+                Ok(Response::new(CheckResponse::with_status(
+                    Status::permission_denied(message),
+                )))
+            };
+        }
+        
+        Telemetry::record_cache_miss();
+        
+        // Create Cedar request
+        let cedar_request = CedarRequest::new(
+            principal_entity.clone(),
+            action_entity.clone(),
+            resource_entity.clone(),
+            merged_context,
+            None,
+        ).unwrap();
+
+        // Get entities for this request
+        let entities = match self.get_entities_for_request(claims, resource_info).await {
+            Ok(e) => e,
+            Err(status) => {
+                warn!("Failed to get entities for request: {:?}", status);
+                return Ok(Response::new(CheckResponse::with_status(status)));
+            }
+        };
+
+        // Time the Cedar policy evaluation
+        let eval_timer = Telemetry::time_cedar_evaluation();
+        
+        // Safely unwrap the authorizer since we've verified we're in local eval mode
+        let authorizer = self.authorizer.as_ref().unwrap();
+        
+        // Perform the authorization check with the entities
+        let auth_result = match authorizer.read().await.is_authorized(&cedar_request, &entities).await {
+            Ok(result) => result,
+            Err(err) => {
+                error!("Authorization error: {}", err);
+                return Ok(Response::new(CheckResponse::with_status(
+                    Status::internal("Authorization system error"),
+                )));
+            }
+        };
+        
+        // End the evaluation timer
+        drop(eval_timer);
+        
+        // Cache the authorization result
+        self.auth_cache.put(
+            &principal_entity, 
+            &action_entity, 
+            &resource_entity, 
+            context_hash, 
+            &auth_result
+        ).await;
+        
+        // Check the decision
+        if matches!(auth_result.decision(), cedar_policy::Decision::Allow) {
+            info!("Authorization allowed: principal={}, action={}, resource={}", 
+                principal, action, resource);
+            
+            // Record the metric
+            Telemetry::record_request(method, path, "allowed");
+            
+            // Allow the request and add any custom headers if needed
+            Ok(Response::new(CheckResponse::with_status(
+                Status::ok("Request authorized"),
+            )))
+        } else {
+            warn!("Authorization denied: principal={}, action={}, resource={}", 
+                principal, action, resource);
+            
+            // Record the metric
+            Telemetry::record_request(method, path, "denied");
+            
+            // Get diagnostics for better error messages
+            let message = if auth_result.diagnostics().errors().next().is_some() {
+                let errors = auth_result.diagnostics().errors()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!("Request not authorized: {}", errors)
+            } else {
+                "Request not authorized".to_string()
+            };
+            
+            // Deny the request
+            Ok(Response::new(CheckResponse::with_status(
+                Status::permission_denied(message),
+            )))
+        }
     }
     
     // Method to fetch entities for Cedar authorization
@@ -343,10 +831,14 @@ impl AvpAuthorizationService {
         debug!("Triggering policy refresh");
         
         // Send signal to the background task
-        self.policy_refresh_sender.send(()).await.map_err(|e| {
-            error!("Failed to trigger policy refresh: {}", e);
-            Status::internal("Failed to trigger policy refresh")
-        })?;
+        if let Some(sender) = &self.policy_refresh_sender {
+            sender.send(()).await.map_err(|e| {
+                error!("Failed to trigger policy refresh: {}", e);
+                Status::internal("Failed to trigger policy refresh")
+            })?;
+        } else {
+            debug!("No policy refresh sender available");
+        }
         
         Ok(())
     }
@@ -418,9 +910,8 @@ impl Authorization for AvpAuthorizationService {
         &self,
         request: Request<CheckRequest>,
     ) -> Result<Response<CheckResponse>, Status> {
-        // Extract the request and decode the attributes
+        // Extract the request and decode the attributes (keep this part)
         let check_request = request.into_inner();
-        
         debug!("Received authorization request");
         
         // Get request attributes
@@ -445,31 +936,31 @@ impl Authorization for AvpAuthorizationService {
             }
         };
         
-        // Extract path and method from the request for metrics
+        // Extract path and method
         let path = http.path.clone();
         let method = http.method.clone();
         
         // Start timing the request
-        let request_timer = Telemetry::time_request(&method, &path);
+        let _request_timer = Telemetry::time_request(&method, &path);
         
         // Parse query parameters
         let query_params = parse_query_params(&path);
         
-        // Convert headers to a HashMap for easier access
+        // Convert headers to a HashMap
         let mut headers = HashMap::new();
         for header in &http.headers {
             headers.insert(header.0.to_lowercase(), header.1.clone());
         }
 
         // Extract and validate JWT token
-        let claims = match headers.get("authorization") {
+        let (token, claims) = match headers.get("authorization") {
             Some(auth) => {
                 if let Some(token) = auth.strip_prefix("Bearer ") {
-                    // Proper JWT validation
+                    // Validate JWT
                     match self.jwt_validator.validate_token(token).await {
                         Ok(claims) => {
                             Telemetry::record_jwt_validation(&claims.iss, true);
-                            claims
+                            (token, claims)
                         },
                         Err(err) => {
                             Telemetry::record_jwt_validation(self.jwt_validator.get_issuer(), false);
@@ -518,212 +1009,15 @@ impl Authorization for AvpAuthorizationService {
             }
         };
         
-        // Use the validated subject from JWT as principal ID
-        let principal_id = claims.sub.clone();
-        let principal = format!("User::\"{principal_id}\"");
-        let principal_entity: EntityUid = principal.parse().unwrap();
-        
-        // Map HTTP method to Cedar action based on resource type
+        // Map HTTP method to Cedar action
         let action = resource_mapper.map_method_to_action(&method, &path, &resource_info);
-        let action_entity: EntityUid = action.parse().unwrap();
         
-        // Get resource entity from path information
-        let resource = format!("Resource::\"{}\"", resource_info.to_entity_uid());
-        let resource_entity: EntityUid = resource.parse().unwrap();
-
-        // Create context from request information
-        // let request_context = resource_mapper.create_request_context(
-        //     &method, 
-        //     &path, 
-        //     &query_params, 
-        //     &headers
-        // );
-        
-        // Merge with resource context
-        // let resource_context = resource_info.to_context();
-        // Modified approach for creating the merged context
-        let merged_context = {
-            // Create a simple HashMap of String -> String values
-            let mut context_pairs = HashMap::new();
-            
-            // Add basic request information
-            context_pairs.insert("http_method".to_string(), method.to_string());
-            context_pairs.insert("http_path".to_string(), path.to_string());
-            
-            // Add query parameters with prefix
-            for (k, v) in &query_params {
-                context_pairs.insert(format!("query_{}", k), v.clone());
-            }
-            
-            // Add selected headers
-            for (k, v) in &headers {
-                context_pairs.insert(format!("header_{}", k.replace('-', "_")), v.clone());
-            }
-            
-            // Add resource information
-            context_pairs.insert("resource_type".to_string(), resource_info.resource_type.clone());
-            
-            if let Some(ref id) = resource_info.resource_id {
-                context_pairs.insert("resource_id".to_string(), id.clone());
-            }
-            
-            if let Some(ref parent_type) = resource_info.parent_type {
-                context_pairs.insert("parent_type".to_string(), parent_type.clone());
-            }
-            
-            if let Some(ref parent_id) = resource_info.parent_id {
-                context_pairs.insert("parent_id".to_string(), parent_id.clone());
-            }
-            
-            // Add resource parameters
-            for (k, v) in &resource_info.parameters {
-                context_pairs.insert(format!("param_{}", k), v.clone());
-            }
-            
-            // Add JWT claims to context
-            for (k, v) in &claims.additional_claims {
-                context_pairs.insert(format!("jwt_{}", k), v.to_string());
-            }
-            
-            // Create a JSON string from the map
-            match serde_json::to_string(&context_pairs) {
-                Ok(json_str) => match Context::from_json_str(&json_str, None) {
-                    Ok(context) => context,
-                    Err(e) => {
-                        debug!("Failed to create context from JSON: {}", e);
-                        Context::empty()
-                    }
-                },
-                Err(e) => {
-                    debug!("Failed to serialize context to JSON: {}", e);
-                    Context::empty()
-                }
-            }
-        };
-        
-        // Compute context hash for cache key
-        let context_hash = AuthorizationCache::compute_context_hash(&format!("{:?}", merged_context));
-
-
-        debug!("Checking authorization: principal={}, action={}, resource={}", 
-            principal, action, resource);
-
-        // Try to get result from cache first
-        if let Some((decision, diagnostics)) = self.auth_cache.get(
-            &principal_entity, 
-            &action_entity, 
-            &resource_entity, 
-            context_hash
-        ).await {
-            Telemetry::record_cache_hit();
-            
-            debug!("Using cached authorization decision: {:?}", decision);
-            
-            // Return the cached decision
-            return if matches!(decision, Decision::Allow) {
-                info!("Authorization allowed (cached): principal={}, action={}, resource={}", 
-                    principal, action, resource);
-                
-                Ok(Response::new(CheckResponse::with_status(
-                    Status::ok("Request authorized"),
-                )))
-            } else {
-                warn!("Authorization denied (cached): principal={}, action={}, resource={}", 
-                    principal, action, resource);
-                
-                // Include diagnostics if available
-                let message = if let Some(diag) = diagnostics {
-                    format!("Request not authorized: {}", diag)
-                } else {
-                    "Request not authorized".to_string()
-                };
-                
-                Ok(Response::new(CheckResponse::with_status(
-                    Status::permission_denied(message),
-                )))
-            };
-        }
-        
-        Telemetry::record_cache_miss();
-        
-        // Create Cedar request
-        let cedar_request = CedarRequest::new(
-            principal_entity.clone(),
-            action_entity.clone(),
-            resource_entity.clone(),
-            merged_context,
-            None,
-        ).unwrap();
-
-        // Get entities for this request
-        let entities = match self.get_entities_for_request(&claims, &resource_info).await {
-            Ok(e) => e,
-            Err(status) => {
-                warn!("Failed to get entities for request: {:?}", status);
-                return Ok(Response::new(CheckResponse::with_status(status)));
-            }
-        };
-
-        // Time the Cedar policy evaluation
-        let eval_timer = Telemetry::time_cedar_evaluation();
-        
-        // Perform the authorization check with the entities
-        let auth_result = match self.authorizer.read().await.is_authorized(&cedar_request, &entities).await {
-            Ok(result) => result,
-            Err(err) => {
-                error!("Authorization error: {}", err);
-                return Ok(Response::new(CheckResponse::with_status(
-                    Status::internal("Authorization system error"),
-                )));
-            }
-        };
-        
-        // End the evaluation timer
-        drop(eval_timer);
-        
-        // Cache the authorization result
-        self.auth_cache.put(
-            &principal_entity, 
-            &action_entity, 
-            &resource_entity, 
-            context_hash, 
-            &auth_result
-        ).await;
-        
-        // Check the decision
-        if matches!(auth_result.decision(), Decision::Allow) {
-            info!("Authorization allowed: principal={}, action={}, resource={}", 
-                principal, action, resource);
-            
-            // Record the metric
-            Telemetry::record_request(&method, &path, "allowed");
-            
-            // Allow the request and add any custom headers if needed
-            Ok(Response::new(CheckResponse::with_status(
-                Status::ok("Request authorized"),
-            )))
+        // Branch based on evaluation mode
+        if !self.use_local_evaluation {
+            // Use AVP API directly
+            return self.check_with_avp_api(token, &claims, &method, &path, &resource_info, action, &query_params, &headers).await;
         } else {
-            warn!("Authorization denied: principal={}, action={}, resource={}", 
-                principal, action, resource);
-            
-            // Record the metric
-            Telemetry::record_request(&method, &path, "denied");
-            
-            // Get diagnostics for better error messages
-            let message = if auth_result.diagnostics().errors().next().is_some() {
-                let errors = auth_result.diagnostics().errors()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                format!("Request not authorized: {}", errors)
-            } else {
-                "Request not authorized".to_string()
-            };
-            
-            // Deny the request
-            Ok(Response::new(CheckResponse::with_status(
-                Status::permission_denied(message),
-            )))
+            return self.check_with_local_evaluation(&claims, &method, &path, &resource_info, action, &query_params, &headers).await;
         }
     }
 }
@@ -831,6 +1125,8 @@ async fn main() -> Result<()> {
     
     // Create our authorization service
     info!("Initializing AVP authorization service");
+    
+    // Create the service with appropriate mode
     let (avp_auth_service, policy_refresh_rx) = AvpAuthorizationService::new(
         args.region, 
         args.policy_store_id.clone(),
@@ -841,26 +1137,29 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.policy_cache_ttl),
         args.policy_cache_size,
         args.schema_path,
+        args.local_evaluation,
     ).await?;
     
-    // Start the policy refresh background task
-    let authorizer_clone = avp_auth_service.authorizer.clone();
-    let auth_cache_clone = avp_auth_service.auth_cache.clone();
-    let policy_refresh_interval = Duration::from_secs(args.policy_refresh_interval);
-    
-    tokio::spawn(async move {
-        AvpAuthorizationService::run_policy_refresh_task(
-            authorizer_clone,
-            auth_cache_clone,
-            policy_refresh_rx,
-            policy_refresh_interval,
-        ).await;
-    });
+    // Start the policy refresh background task if needed
+    if let Some(rx) = policy_refresh_rx {
+        let authorizer_clone = avp_auth_service.authorizer.clone().unwrap();
+        let auth_cache_clone = avp_auth_service.auth_cache.clone();
+        let policy_refresh_interval = Duration::from_secs(args.policy_refresh_interval);
+        
+        tokio::spawn(async move {
+            AvpAuthorizationService::run_policy_refresh_task(
+                authorizer_clone,
+                auth_cache_clone,
+                rx,
+                policy_refresh_interval,
+            ).await;
+        });
+    }
     
     info!("Starting gRPC server on {}", addr);
     Server::builder()
         .add_service(AuthorizationServer::new(avp_auth_service))
-        .add_service(health::new_health_service())  // Add health service
+        .add_service(health::new_health_service())
         .serve(addr)
         .await?;
     

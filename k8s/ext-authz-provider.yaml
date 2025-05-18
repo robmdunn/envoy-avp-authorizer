@@ -1,0 +1,13 @@
+# ext-authz-provider.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio
+  namespace: istio-system
+data:
+  mesh: |-
+    extensionProviders:
+    - name: "avp-authorizer"
+      envoyExtAuthzGrpc:
+        service: "avp-authorizer.istio-system.svc.cluster.local"
+        port: "50051"

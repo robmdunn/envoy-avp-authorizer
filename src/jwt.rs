@@ -2,12 +2,13 @@ use jsonwebtoken::{decode, decode_header, DecodingKey, Validation, Algorithm};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use tokio::sync::RwLock; // Replace std::sync::RwLock with tokio::sync::RwLock
+use tokio::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+use tracing::{debug, warn, error};
 
 // JWT Claims structure
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Claims {
     pub sub: String,
     pub exp: u64,
@@ -15,6 +16,8 @@ pub struct Claims {
     pub iss: String,
     pub aud: Option<String>,
     pub roles: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub additional_claims: HashMap<String, Value>,
 }
 
 #[derive(Debug, Error)]
@@ -22,11 +25,9 @@ pub enum JwtError {
     #[error("Token expired")]
     Expired,
     
-    #[allow(dead_code)]
     #[error("Invalid token format: {0}")]
     InvalidFormat(String),
     
-    #[allow(dead_code)]
     #[error("Invalid token signature: {0}")]
     InvalidSignature(String),
     
@@ -56,7 +57,6 @@ pub enum JwtError {
 struct CachedJwk {
     key: DecodingKey,
     algorithm: Algorithm,
-    #[allow(dead_code)]
     expiry: Instant,
 }
 
@@ -79,20 +79,27 @@ impl JwksCache {
     }
     
     // Refresh the JWKS cache if needed
-    // pub async fn refresh_if_needed(&mut self) -> Result<(), JwtError> {
-    //     if self.last_refresh.elapsed() >= self.cache_duration {
-    //         self.refresh().await?;
-    //     }
-    //     Ok(())
-    // }
+    pub async fn refresh_if_needed(&mut self) -> Result<(), JwtError> {
+        if self.last_refresh.elapsed() >= self.cache_duration {
+            debug!("JWKS cache expired, refreshing from {}", self.jwks_url);
+            self.refresh().await?;
+        }
+        Ok(())
+    }
     
     // Forcefully refresh the JWKS cache
     pub async fn refresh(&mut self) -> Result<(), JwtError> {
         let client = reqwest::Client::new();
+        debug!("Fetching JWKS from {}", self.jwks_url);
+        
         let jwks_response = client.get(&self.jwks_url)
+            .timeout(Duration::from_secs(5)) // Add timeout
             .send()
             .await
-            .map_err(|e| JwtError::JwksFetchError(e.to_string()))?;
+            .map_err(|e| {
+                error!("Failed to fetch JWKS: {}", e);
+                JwtError::JwksFetchError(e.to_string())
+            })?;
             
         let jwks_json = jwks_response
             .text()
@@ -105,6 +112,8 @@ impl JwksCache {
         let keys = jwks["keys"].as_array()
             .ok_or_else(|| JwtError::JwksFetchError("Invalid JWKS format: missing 'keys' array".to_string()))?;
             
+        debug!("Received {} keys from JWKS endpoint", keys.len());
+        
         // Clear existing keys
         self.keys.clear();
         
@@ -121,7 +130,8 @@ impl JwksCache {
                         Some("HS256") => Algorithm::HS256,
                         Some("HS384") => Algorithm::HS384,
                         Some("HS512") => Algorithm::HS512,
-                        Some(_alg) => {
+                        Some(alg) => {
+                            warn!("Unsupported algorithm in JWKS: {}", alg);
                             // Skip unsupported algorithms
                             continue;
                         },
@@ -156,6 +166,7 @@ impl JwksCache {
                                 .map_err(|e| JwtError::JwksFetchError(format!("Failed to create symmetric key: {}", e)))?
                         },
                         _ => {
+                            warn!("Unsupported key type in JWKS: {}", kty);
                             // Skip unsupported key types
                             continue;
                         }
@@ -170,29 +181,45 @@ impl JwksCache {
                         algorithm,
                         expiry,
                     });
+                    
+                    debug!("Added key with kid '{}' to JWKS cache", kid);
                 }
             }
         }
         
         self.last_refresh = Instant::now();
+        debug!("JWKS cache refreshed successfully with {} keys", self.keys.len());
         Ok(())
     }
     
     // Get a key by its ID
     pub fn get_key(&self, kid: &str) -> Option<(&DecodingKey, Algorithm)> {
-        self.keys.get(kid).map(|cached| (&cached.key, cached.algorithm))
+        let result = self.keys.get(kid).map(|cached| (&cached.key, cached.algorithm));
+        if result.is_none() {
+            debug!("Key with kid '{}' not found in JWKS cache", kid);
+        }
+        result
     }
 }
 
 pub struct JwtValidator {
-    jwks_cache: RwLock<JwksCache>, // No need for Arc with tokio::sync::RwLock
+    jwks_cache: RwLock<JwksCache>,
     issuer: String,
     audience: Option<String>,
+    clock_skew_leeway: Duration,
 }
 
 impl JwtValidator {
-    pub async fn new(jwks_url: String, issuer: String, audience: Option<String>) -> Result<Self, JwtError> {
-        let mut jwks_cache = JwksCache::new(jwks_url, Duration::from_secs(3600)); // 1 hour cache
+    pub async fn new(
+        jwks_url: String, 
+        issuer: String, 
+        audience: Option<String>,
+        cache_duration: Option<Duration>,
+        clock_skew_leeway: Option<Duration>,
+    ) -> Result<Self, JwtError> {
+        let cache_duration = cache_duration.unwrap_or(Duration::from_secs(3600)); // Default 1 hour
+        let mut jwks_cache = JwksCache::new(jwks_url, cache_duration);
+        let clock_skew_leeway = clock_skew_leeway.unwrap_or(Duration::from_secs(30)); // Default 30 seconds
         
         // Initialize the cache
         jwks_cache.refresh().await?;
@@ -201,7 +228,12 @@ impl JwtValidator {
             jwks_cache: RwLock::new(jwks_cache),
             issuer,
             audience,
+            clock_skew_leeway,
         })
+    }
+    
+    pub fn get_issuer(&self) -> &str {
+        &self.issuer
     }
     
     pub async fn validate_token(&self, token: &str) -> Result<Claims, JwtError> {
@@ -212,28 +244,27 @@ impl JwtValidator {
         let kid = header.kid.ok_or_else(|| 
             JwtError::HeaderDecodeError("No 'kid' found in JWT header".to_string()))?;
             
-        // Get the appropriate key from the cache using tokio's async RwLock
-        let decoding_key_and_alg = {
-            // Acquire a read lock on the cache - note the .await
-            let cache = self.jwks_cache.read().await;
+        // Check if cache needs refreshing and get the appropriate key
+        let (decoding_key, algorithm) = {
+            // Acquire a write lock to check/refresh cache as needed
+            let mut cache = self.jwks_cache.write().await;
             
-            cache.get_key(&kid).map(|(key, alg)| (key.clone(), alg))
-        };
-
-        // If key not found, refresh cache and try again
-        let (decoding_key, algorithm) = match decoding_key_and_alg {
-            Some(key_alg) => key_alg,
-            None => {
-                // Acquire write lock to refresh cache - note the .await
-                let mut cache = self.jwks_cache.write().await;
+            // Proactively refresh if needed
+            cache.refresh_if_needed().await?;
+            
+            // Try to get the key
+            match cache.get_key(&kid) {
+                Some((key, alg)) => (key.clone(), alg),
+                None => {
+                    // Force refresh if key not found
+                    debug!("Key not found in cache, forcing refresh");
+                    cache.refresh().await?;
                     
-                // Refresh the cache
-                cache.refresh().await?;
-                
-                // Try to get the key again
-                match cache.get_key(&kid) {
-                    Some((key, alg)) => (key.clone(), alg),
-                    None => return Err(JwtError::KeyNotFound(kid)),
+                    // Try again after refresh
+                    match cache.get_key(&kid) {
+                        Some((key, alg)) => (key.clone(), alg),
+                        None => return Err(JwtError::KeyNotFound(kid)),
+                    }
                 }
             }
         };
@@ -246,24 +277,27 @@ impl JwtValidator {
             validation.set_audience(&[aud]);
         }
         
+        // Allow for clock skew
+        validation.leeway = self.clock_skew_leeway.as_secs() as u64;
+        
         // Decode and validate the token
         let token_data = decode::<Claims>(token, &decoding_key, &validation)?;
         
         // Additional validation
         let claims = token_data.claims;
         
-        // Verify token is not expired
+        // Verify token is not expired (with leeway)
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_secs();
             
-        if claims.exp < now {
+        if claims.exp + (self.clock_skew_leeway.as_secs() as u64) < now {
             return Err(JwtError::Expired);
         }
         
-        // Verify token is not used before it's valid
-        if claims.iat > now {
+        // Verify token is not used before it's valid (with leeway)
+        if claims.iat > now + self.clock_skew_leeway.as_secs() as u64 {
             return Err(JwtError::NotYetValid);
         }
         

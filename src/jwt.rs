@@ -22,9 +22,11 @@ pub enum JwtError {
     #[error("Token expired")]
     Expired,
     
+    #[allow(dead_code)]
     #[error("Invalid token format: {0}")]
     InvalidFormat(String),
     
+    #[allow(dead_code)]
     #[error("Invalid token signature: {0}")]
     InvalidSignature(String),
     
@@ -47,13 +49,14 @@ pub enum JwtError {
     HeaderDecodeError(String),
     
     #[error("JWT processing error: {0}")]
-    JwtError(#[from] jsonwebtoken::errors::Error),
+    JsonWebTokenError(#[from] jsonwebtoken::errors::Error),
 }
 
 // Structure to represent a cached JWK
 struct CachedJwk {
     key: DecodingKey,
     algorithm: Algorithm,
+    #[allow(dead_code)]
     expiry: Instant,
 }
 

@@ -912,7 +912,8 @@ impl Authorization for AvpAuthorizationService {
     ) -> Result<Response<CheckResponse>, Status> {
         // Extract the request and decode the attributes (keep this part)
         let check_request = request.into_inner();
-        debug!("Received authorization request");
+        // debug!("Received authorization request");
+        debug!("Received full check request: {:?}", check_request);
         
         // Get request attributes
         let attributes = match check_request.attributes.as_ref() {
@@ -925,8 +926,16 @@ impl Authorization for AvpAuthorizationService {
             }
         };
         
+        debug!("Attributes: {:?}", attributes);
+        debug!("Request field: {:?}", attributes.request);
+
         // Get HTTP request details
-        let http = match attributes.request.as_ref().and_then(|r| r.http.as_ref()) {
+        let http = match attributes.request.as_ref().and_then(|r| {
+            debug!("Request object: {:?}", r);
+            let http_ref = r.http.as_ref();
+            debug!("HTTP field: {:?}", http_ref); 
+            http_ref
+        }) {
             Some(http) => http,
             None => {
                 warn!("Request has no HTTP information");

@@ -426,8 +426,11 @@ impl AvpAuthorizationService {
             .send()
             .await
             .map_err(|e| {
-                error!("AVP authorization error: {}", e);
-                Status::internal("Authorization service error")
+                error!("AVP authorization error: {} ({:?})", e, e);
+                if let aws_sdk_verifiedpermissions::error::SdkError::ServiceError(service_err) = &e {
+                    error!("Service error details: {:?}", service_err);
+                }
+                Status::internal(format!("Authorization service error: {}", e))
             })?;
             
             // End the evaluation timer
@@ -1017,6 +1020,13 @@ impl Authorization for AvpAuthorizationService {
                 )));
             }
         };
+
+        debug!("Parsed path '{}' to: resource_type={}, resource_id={:?}, parent_type={:?}, parent_id={:?}",
+            path,
+            resource_info.resource_type,
+            resource_info.resource_id,
+            resource_info.parent_type,
+            resource_info.parent_id);
         
         // Map HTTP method to Cedar action
         let action = resource_mapper.map_method_to_action(&method, &path, &resource_info);

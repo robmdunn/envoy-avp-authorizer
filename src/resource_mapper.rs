@@ -72,13 +72,11 @@ impl ResourcePath {
             (Some(id), _, _) => {
                 format!("{}::{}", self.resource_type, id)
             },
-            // Resource collection with parent
             (None, Some(parent_type), Some(parent_id)) => {
-                format!("{}Collection::{parent_type}::{parent_id}", self.resource_type)
+                format!("{}::{parent_type}::{parent_id}", self.resource_type)
             },
-            // Resource collection, no parent
             _ => {
-                format!("{}Collection", self.resource_type)
+                self.resource_type.clone()
             }
         };
         debug!("Converted ResourcePath to entity_uid: '{}'", result);
@@ -269,7 +267,7 @@ impl ResourceMapper {
             .collect();
             
         self.pattern_set = RegexSet::new(&patterns)
-            .unwrap_or_else(|_| RegexSet::new(&[""]).unwrap());
+            .unwrap_or_else(|_| RegexSet::new([""]).unwrap());
     }
     
     // Convert a pattern with placeholders to a regex pattern
@@ -354,7 +352,7 @@ impl ResourceMapper {
         };
         
         // Extract resource ID if present in the pattern
-        let resource_id = if pattern.resource_id_group.as_ref().map_or(false, |g| g == "resource") && 
+        let resource_id = if pattern.resource_id_group.as_ref().is_some_and(|g| g == "resource") && 
                         captures.name("id").is_some() {
             // Special case for {parent}/{parentId}/{resource}/{id} pattern
             // Use the "id" group as the resource ID instead of the "resource" group
@@ -465,13 +463,25 @@ impl ResourceMapper {
     pub fn map_method_to_action(&self, method: &str, path: &str, resource_info: &ResourcePath) -> String {
         debug!("Mapping method '{}' to action for path '{}'", method, path);
         
+        // Clean up the path by removing the API prefix if present
+        let clean_path = if let Some(captures) = self.api_prefix_regex.captures(path) {
+            let matched_prefix = captures.get(0).map_or("", |m| m.as_str());
+            debug!("Removing API prefix: '{}' from path for action mapping", matched_prefix);
+            path.strip_prefix(matched_prefix).unwrap_or(path)
+        } else {
+            path.trim_start_matches('/')
+        };
+        
+        debug!("Using clean path for action mapping: '{}'", clean_path);
+        
         // Check if we have a custom action mapping for this path
         for (pattern, action_map) in &self.custom_action_maps {
-            if pattern.is_match(path) {
-                debug!("Path '{}' matched custom action pattern", path);
+            if pattern.is_match(clean_path) {
+                debug!("Path '{}' matched custom action pattern", clean_path);
                 if let Some(action) = action_map.get(&method.to_uppercase()) {
                     debug!("Mapped method '{}' to custom action '{}'", method, action);
-                    return format!("Action::\"{}\"", action);
+                    // Return the full action string directly from the mapping
+                    return action.clone();
                 }
             }
         }
@@ -485,22 +495,7 @@ impl ResourceMapper {
                 "access".to_string()
             });
             
-        // If it's a collection resource (no ID), adjust the action accordingly
-        let action = match (&resource_info.resource_id, base_action.as_str()) {
-            (None, "read") => {
-                debug!("Adjusted action from 'read' to 'list' for collection resource");
-                "list"
-            },
-            (None, "update") => {
-                debug!("Adjusted action from 'update' to 'update_bulk' for collection resource");
-                "update_bulk"
-            },
-            (None, "delete") => {
-                debug!("Adjusted action from 'delete' to 'delete_bulk' for collection resource");
-                "delete_bulk"
-            },
-            _ => &base_action,
-        };
+        let action = &base_action;
         
         debug!("Final mapped action: '{}' for method '{}' on path '{}'", action, method, path);
         format!("Action::\"{}\"", action)

@@ -332,11 +332,7 @@ impl AvpAuthorizationService {
         
         // Get the resource entity ID from resource info
         let resource_entity_id = resource_info.to_entity_uid();
-        let resource_entity_type = if resource_info.resource_id.is_some() {
-            resource_info.resource_type.clone()
-        } else {
-            format!("{}Collection", resource_info.resource_type)
-        };
+        let resource_entity_type = resource_info.resource_type.clone();
         debug!("Using resource_entity_id: '{}', resource_entity_type: '{}'", 
             resource_entity_id, resource_entity_type);
         

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::{debug, warn, error};
+use tracing::{debug, error, info, trace, warn};
 
 // JWT Claims structure
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -217,6 +217,9 @@ impl JwtValidator {
         cache_duration: Option<Duration>,
         clock_skew_leeway: Option<Duration>,
     ) -> Result<Self, JwtError> {
+        info!("Initializing JWT validator for issuer: {}, cache duration: {:?}", 
+            issuer, cache_duration);
+
         let cache_duration = cache_duration.unwrap_or(Duration::from_secs(3600)); // Default 1 hour
         let mut jwks_cache = JwksCache::new(jwks_url, cache_duration);
         let clock_skew_leeway = clock_skew_leeway.unwrap_or(Duration::from_secs(30)); // Default 30 seconds
@@ -237,6 +240,9 @@ impl JwtValidator {
     }
     
     pub async fn validate_token(&self, token: &str) -> Result<Claims, JwtError> {
+
+        trace!("Validating JWT token for issuer: {}", self.issuer);
+        
         // Decode JWT header to get the key ID
         let header = decode_header(token)
             .map_err(|e| JwtError::HeaderDecodeError(e.to_string()))?;

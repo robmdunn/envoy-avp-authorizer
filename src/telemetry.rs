@@ -1,4 +1,5 @@
 use metrics::{counter, histogram};
+use tracing::info;
 use std::time::Instant;
 
 // Define metric names
@@ -21,6 +22,7 @@ pub struct Telemetry;
 impl Telemetry {
     // Initialize metrics (called once at startup)
     pub fn init() {
+        info!("Initializing telemetry on port 9000");
         let addr = ([0, 0, 0, 0], 9000);
         
         // Configure metrics (could be updated to export to Prometheus, etc.)

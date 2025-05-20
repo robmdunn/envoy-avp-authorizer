@@ -3,6 +3,7 @@ use tonic_health::pb::health_server::{Health, HealthServer};
 use tonic_health::pb::{HealthCheckRequest, HealthCheckResponse};
 use tonic_health::pb::health_check_response::ServingStatus;
 use futures_channel::mpsc;
+use tracing::{debug, info, trace};
 
 #[derive(Debug, Default)]
 pub struct HealthService {}
@@ -13,8 +14,9 @@ impl Health for HealthService {
         &self,
         _request: Request<HealthCheckRequest>,
     ) -> Result<Response<HealthCheckResponse>, Status> {
+        trace!("Health check requested");
+
         // For now, we'll just always return healthy
-        // In a more advanced implementation, we could check other components
         let reply = HealthCheckResponse {
             status: ServingStatus::Serving as i32,
         };
@@ -28,6 +30,8 @@ impl Health for HealthService {
         &self,
         _request: Request<HealthCheckRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        debug!("Health watch stream requested");
+
         // Create a channel for streaming responses - use a buffer size of 4
         let (mut tx, rx) = mpsc::channel(4);
         
@@ -43,6 +47,7 @@ impl Health for HealthService {
 }
 
 pub fn new_health_service() -> HealthServer<HealthService> {
+    info!("Initializing health check service");
     let service = HealthService::default();
     HealthServer::new(service)
 }

@@ -330,7 +330,7 @@ impl AvpAuthorizationService {
         
         // Extract the action ID (e.g., "read" from "Action::\"read\"")
         let action_id = action.trim_start_matches("Action::\"").trim_end_matches("\"");
-        debug!("Extracted action_id: '{}' from action: '{}'", action_id, action);
+        trace!("Extracted action_id: '{}' from action: '{}'", action_id, action);
         
         // Get the resource entity ID from resource info
         let resource_entity_id = resource_info.to_entity_uid();
@@ -695,6 +695,9 @@ impl AvpAuthorizationService {
             None,
         ).unwrap();
 
+        trace!("Creating Cedar request: principal={}, action={}, resource={}", 
+            principal_entity, action_entity, resource_entity);
+
         // Get entities for this request
         let entities = match self.get_entities_for_request(claims, resource_info).await {
             Ok(e) => e,
@@ -959,6 +962,8 @@ impl Authorization for AvpAuthorizationService {
         // Extract path and method
         let path = http.path.clone();
         let method = http.method.clone();
+
+        trace!("Authorization request received: method={}, path={}", method, path);
         
         // Start timing the request
         let _request_timer = Telemetry::time_request(&method, &path);
@@ -1016,6 +1021,8 @@ impl Authorization for AvpAuthorizationService {
                 )));
             }
         };
+
+        debug!("JWT token validated successfully for user: {}", claims.sub);
         
         // Parse the path into resource information
         let resource_mapper = RESOURCE_MAPPER.read().await;

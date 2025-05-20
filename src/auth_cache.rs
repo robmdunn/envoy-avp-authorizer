@@ -48,6 +48,7 @@ pub struct AuthorizationCache {
 
 impl AuthorizationCache {
     pub fn new(ttl: Duration, max_size: usize) -> Self {
+        info!("Initializing authorization cache with TTL: {:?}, max size: {}", ttl, max_size);
         AuthorizationCache {
             cache: RwLock::new(HashMap::with_capacity(max_size)),
             ttl,
@@ -83,10 +84,10 @@ impl AuthorizationCache {
         let cache = self.cache.read().await;
         if let Some(entry) = cache.get(&key) {
             if entry.expires_at > Instant::now() {
-                debug!("Cache hit for {}/{}/{}", principal, action, resource);
+                trace!("Cache hit for {}/{}/{}", principal, action, resource);
                 return Some((entry.decision, entry.diagnostics.clone()));
             } else {
-                debug!("Cache entry expired for {}/{}/{}", principal, action, resource);
+                trace!("Cache entry expired for {}/{}/{}", principal, action, resource);
             }
         } else {
             trace!("Cache miss for {}/{}/{}", principal, action, resource);
@@ -129,6 +130,8 @@ impl AuthorizationCache {
                 }
             },
         };
+
+        trace!("Storing decision in cache for {}/{}/{}", principal, action, resource);
 
         let mut cache = self.cache.write().await;
         

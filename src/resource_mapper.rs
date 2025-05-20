@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use cedar_policy::{Context};
-use tracing::{debug, warn};
+use tracing::{debug, info, trace, warn};
 use regex::{Regex, RegexSet};
 use thiserror::Error;
 use std::str::FromStr;
@@ -390,7 +390,7 @@ impl ResourceMapper {
         for (param_name, group_name) in &pattern.parameter_groups {
             if let Some(capture) = captures.name(group_name) {
                 let value = capture.as_str().to_string();
-                debug!("Extracted parameter: {}={} from group: {}", param_name, value, group_name);
+                trace!("Extracted parameter: {}={} from group: {}", param_name, value, group_name);
                 parameters.insert(param_name.clone(), value);
             } else {
                 debug!("Failed to extract parameter: {} from group: {}", param_name, group_name);
@@ -555,6 +555,9 @@ impl ResourceMapper {
 
 // Default configuration for ResourceMapper
 pub fn create_default_resource_mapper(api_prefix_pattern: &str) -> ResourceMapper {
+    info!("Creating default resource mapper with API prefix pattern: {}", 
+        api_prefix_pattern);
+
     let mut mapper = ResourceMapper::new(api_prefix_pattern);
     
     debug!("Using default patterns without API prefix for resource mappings");

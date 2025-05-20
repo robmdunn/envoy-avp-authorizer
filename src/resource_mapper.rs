@@ -298,17 +298,39 @@ impl ResourceMapper {
             ))?;
             
         // Extract resource type (always present)
-        let resource_type = pattern.resource_type.clone();
+        let resource_type = if pattern.resource_type == "resource" && pattern.resource_id_group.as_ref().is_some() {
+            // If resource_type is the generic "resource" and we have a resource_id_group,
+            // use the captured value as the resource_type
+            captures.name(pattern.resource_id_group.as_ref().unwrap())
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| pattern.resource_type.clone())
+        } else {
+            pattern.resource_type.clone()
+        };
         
         // Extract resource ID if present in the pattern
-        let resource_id = pattern.resource_id_group.as_ref().and_then(|group| {
-            let id = captures.name(group).map(|m| m.as_str().to_string());
-            debug!("Extracted resource_id: {:?} from group: {:?}", id, group);
-            id
-        });
+        let resource_id = if pattern.resource_id_group.as_ref().map_or(false, |g| g == "resource") && 
+                        captures.name("id").is_some() {
+            // Special case for {parent}/{parentId}/{resource}/{id} pattern
+            // Use the "id" group as the resource ID instead of the "resource" group
+            captures.name("id").map(|m| m.as_str().to_string())
+        } else {
+            pattern.resource_id_group.as_ref().and_then(|group| {
+                let id = captures.name(group).map(|m| m.as_str().to_string());
+                debug!("Extracted resource_id: {:?} from group: {:?}", id, group);
+                id
+            })
+        };
         
         // Extract parent type if present in the pattern
-        let parent_type = pattern.parent_type.clone();
+        let parent_type = if pattern.parent_type.as_ref().map_or(false, |pt| pt == "parent") {
+            // If parent_type is the generic "parent", use the captured value
+            captures.name("parent")
+                .map(|m| m.as_str().to_string())
+                .or_else(|| pattern.parent_type.clone())
+        } else {
+            pattern.parent_type.clone()
+        };
         
         // Extract parent ID if present in the pattern
         let parent_id = pattern.parent_id_group.as_ref().and_then(|group| {

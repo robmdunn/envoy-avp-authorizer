@@ -246,17 +246,4 @@ impl AuthorizationCache {
         info!("Cleared {} entries from authorization cache", count);
     }
 
-    // Remove expired entries (can be called periodically)
-    pub async fn remove_expired(&self) {
-        let mut cache = self.cache.write().await;
-        let now = Instant::now();
-        let before_count = cache.len();
-        
-        cache.retain(|_, entry| entry.expires_at > now);
-        
-        let removed = before_count - cache.len();
-        if removed > 0 {
-            debug!("Removed {} expired entries from authorization cache", removed);
-        }
-    }
 }

@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tracing::{debug, error, info, trace, warn};
+use crate::telemetry::Telemetry;
 
 // JWT Claims structure
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -91,6 +92,8 @@ impl JwksCache {
     pub async fn refresh(&mut self) -> Result<(), JwtError> {
         let client = reqwest::Client::new();
         debug!("Fetching JWKS from {}", self.jwks_url);
+
+        let issuer = self.jwks_url.split('/').take(3).collect::<Vec<&str>>().join("/");
         
         let jwks_response = client.get(&self.jwks_url)
             .timeout(Duration::from_secs(5)) // Add timeout
@@ -98,19 +101,29 @@ impl JwksCache {
             .await
             .map_err(|e| {
                 error!("Failed to fetch JWKS: {}", e);
+                Telemetry::record_jwks_refresh(&issuer, false);
                 JwtError::JwksFetchError(e.to_string())
             })?;
             
         let jwks_json = jwks_response
             .text()
             .await
-            .map_err(|e| JwtError::JwksFetchError(e.to_string()))?;
+            .map_err(|e| {
+                Telemetry::record_jwks_refresh(&issuer, false);
+                JwtError::JwksFetchError(e.to_string())
+            })?;
             
         let jwks: Value = serde_json::from_str(&jwks_json)
-            .map_err(|e| JwtError::JwksFetchError(e.to_string()))?;
+            .map_err(|e| {
+                Telemetry::record_jwks_refresh(&issuer, false);
+                JwtError::JwksFetchError(e.to_string())
+            })?;
             
         let keys = jwks["keys"].as_array()
-            .ok_or_else(|| JwtError::JwksFetchError("Invalid JWKS format: missing 'keys' array".to_string()))?;
+            .ok_or_else(|| {
+                Telemetry::record_jwks_refresh(&issuer, false);
+                JwtError::JwksFetchError("Invalid JWKS format: missing 'keys' array".to_string())
+            })?;
             
         debug!("Received {} keys from JWKS endpoint", keys.len());
         
@@ -189,6 +202,8 @@ impl JwksCache {
         
         self.last_refresh = Instant::now();
         debug!("JWKS cache refreshed successfully with {} keys", self.keys.len());
+        Telemetry::record_jwks_refresh(&issuer, true);
+
         Ok(())
     }
     
@@ -284,7 +299,7 @@ impl JwtValidator {
         }
         
         // Allow for clock skew
-        validation.leeway = self.clock_skew_leeway.as_secs() as u64;
+        validation.leeway = self.clock_skew_leeway.as_secs();
         
         // Decode and validate the token
         let token_data = decode::<Claims>(token, &decoding_key, &validation)?;
@@ -298,12 +313,12 @@ impl JwtValidator {
             .expect("Time went backwards")
             .as_secs();
             
-        if claims.exp + (self.clock_skew_leeway.as_secs() as u64) < now {
+        if claims.exp + (self.clock_skew_leeway.as_secs()) < now {
             return Err(JwtError::Expired);
         }
         
         // Verify token is not used before it's valid (with leeway)
-        if claims.iat > now + self.clock_skew_leeway.as_secs() as u64 {
+        if claims.iat > now + self.clock_skew_leeway.as_secs() {
             return Err(JwtError::NotYetValid);
         }
         

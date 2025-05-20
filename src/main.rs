@@ -11,7 +11,6 @@ use avp_local_agent::public::{
     policy_set_provider::PolicySetProvider,
 };
 use clap::Parser;
-use custom_types::{CedarResponse, CedarDiagnostics}; 
 use envoy_types::ext_authz::v3::CheckResponseExt;
 use envoy_types::ext_authz::v3::pb::{
     Authorization, AuthorizationServer, CheckRequest, CheckResponse,
@@ -34,7 +33,6 @@ mod auth_cache;
 mod resource_mapper;
 mod telemetry;
 mod health;
-mod custom_types;
 
 use jwt::{JwtValidator, JwtError, Claims};
 use auth_cache::AuthorizationCache;
@@ -454,7 +452,8 @@ impl AvpAuthorizationService {
             // Extract any errors for diagnostics
             let errors_vec: Vec<String> = auth_result.errors().iter()
                 .map(|e| {
-                    if let desc = e.error_description() {
+                    let desc = e.error_description();
+                    if !desc.is_empty() {
                         desc.to_string()
                     } else {
                         "Unknown error".to_string()
@@ -468,12 +467,6 @@ impl AvpAuthorizationService {
                 None
             };
             
-            // Create a CedarResponse for caching
-            let cedar_response = CedarResponse::new(
-                auth_result.decision().clone(), 
-                CedarDiagnostics::with_errors(errors_vec)
-            );
-
             // Cache the result
             self.auth_cache.put_aws(
                 &principal_entity,
@@ -837,24 +830,6 @@ impl AvpAuthorizationService {
         drop(timer);
         
         Ok(entities)
-    }
-
-    
-    // Trigger a policy refresh
-    async fn trigger_policy_refresh(&self) -> Result<(), Status> {
-        debug!("Triggering policy refresh");
-        
-        // Send signal to the background task
-        if let Some(sender) = &self.policy_refresh_sender {
-            sender.send(()).await.map_err(|e| {
-                error!("Failed to trigger policy refresh: {}", e);
-                Status::internal("Failed to trigger policy refresh")
-            })?;
-        } else {
-            debug!("No policy refresh sender available");
-        }
-        
-        Ok(())
     }
     
     // Background task for policy refreshing

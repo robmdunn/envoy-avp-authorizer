@@ -3,6 +3,38 @@ use cedar_policy::{Context};
 use tracing::{debug, warn};
 use regex::{Regex, RegexSet};
 use thiserror::Error;
+use std::str::FromStr;
+use std::fmt;
+
+// Helper enum to identify explicit capture group references
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldValue {
+    Literal(String),
+    CaptureGroup(String),
+}
+
+impl FromStr for FieldValue {
+    type Err = ResourceMappingError;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Check if the value is a capture group reference (surrounded by curly braces)
+        if s.starts_with("{") && s.ends_with("}") {
+            let capture_name = &s[1..s.len()-1];
+            Ok(FieldValue::CaptureGroup(capture_name.to_string()))
+        } else {
+            Ok(FieldValue::Literal(s.to_string()))
+        }
+    }
+}
+
+impl fmt::Display for FieldValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FieldValue::Literal(s) => write!(f, "{}", s),
+            FieldValue::CaptureGroup(s) => write!(f, "{{{}}}", s),
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ResourceMappingError {
@@ -93,9 +125,9 @@ impl ResourcePath {
 struct ResourcePattern {
     pattern: String,
     regex: Regex,
-    resource_type: String,
+    resource_type: FieldValue,
     resource_id_group: Option<String>,
-    parent_type: Option<String>,
+    parent_type: Option<FieldValue>,
     parent_id_group: Option<String>,
     parameter_groups: HashMap<String, String>,
 }
@@ -157,7 +189,7 @@ impl ResourceMapper {
         self.patterns.iter()
             .map(|p| format!("'{}' -> type: '{}', id_group: {:?}, parent: {:?}/{:?}", 
                             p.pattern, p.resource_type, p.resource_id_group, 
-                            p.parent_type, p.parent_id_group))
+                            p.parent_type.as_ref().map(|pt| pt.to_string()), p.parent_id_group))
             .collect()
     }
 
@@ -182,14 +214,24 @@ impl ResourceMapper {
         let parameter_groups = parameter_groups.into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        
+        // Parse resource_type as FieldValue
+        let resource_type_value = FieldValue::from_str(resource_type)?;
+            
+        // Parse parent_type as FieldValue if provided
+        let parent_type_value = if let Some(pt) = parent_type {
+            Some(FieldValue::from_str(pt)?)
+        } else {
+            None
+        };
             
         // Add the pattern
         self.patterns.push(ResourcePattern {
             pattern: pattern.to_string(),
             regex,
-            resource_type: resource_type.to_string(),
+            resource_type: resource_type_value,
             resource_id_group: resource_id_group.map(ToString::to_string),
-            parent_type: parent_type.map(ToString::to_string),
+            parent_type: parent_type_value,
             parent_id_group: parent_id_group.map(ToString::to_string),
             parameter_groups,
         });
@@ -298,14 +340,17 @@ impl ResourceMapper {
             ))?;
             
         // Extract resource type (always present)
-        let resource_type = if pattern.resource_type == "resource" && pattern.resource_id_group.as_ref().is_some() {
-            // If resource_type is the generic "resource" and we have a resource_id_group,
-            // use the captured value as the resource_type
-            captures.name(pattern.resource_id_group.as_ref().unwrap())
-                .map(|m| m.as_str().to_string())
-                .unwrap_or_else(|| pattern.resource_type.clone())
-        } else {
-            pattern.resource_type.clone()
+        let resource_type = match &pattern.resource_type {
+            FieldValue::Literal(literal_value) => literal_value.clone(),
+            FieldValue::CaptureGroup(capture_name) => {
+                // Use the captured value from the URL
+                captures.name(capture_name)
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_else(|| {
+                        debug!("Capture group '{}' not found, using empty string", capture_name);
+                        String::new()
+                    })
+            }
         };
         
         // Extract resource ID if present in the pattern
@@ -323,13 +368,14 @@ impl ResourceMapper {
         };
         
         // Extract parent type if present in the pattern
-        let parent_type = if pattern.parent_type.as_ref().map_or(false, |pt| pt == "parent") {
-            // If parent_type is the generic "parent", use the captured value
-            captures.name("parent")
-                .map(|m| m.as_str().to_string())
-                .or_else(|| pattern.parent_type.clone())
-        } else {
-            pattern.parent_type.clone()
+        let parent_type = match &pattern.parent_type {
+            Some(FieldValue::Literal(literal_value)) => Some(literal_value.clone()),
+            Some(FieldValue::CaptureGroup(capture_name)) => {
+                // Use the captured value from the URL
+                captures.name(capture_name)
+                    .map(|m| m.as_str().to_string())
+            },
+            None => None,
         };
         
         // Extract parent ID if present in the pattern
@@ -513,31 +559,23 @@ pub fn create_default_resource_mapper(api_prefix_pattern: &str) -> ResourceMappe
     
     debug!("Using default patterns without API prefix for resource mappings");
     
-    // Add common REST API patterns WITHOUT the prefix
+    // Add common REST API patterns WITHOUT the prefix using the explicit capture syntax
     let patterns = [
         // Basic collection/item pattern
-        ("{resource}", "resource", Some("resource"), None, None, HashMap::new()),
-        ("{resource}/{id}", "resource", Some("resource"), Some("id"), None, HashMap::new()),
+        ("{resource}", "{resource}", Some("resource"), None, None, HashMap::new()),
+        ("{resource}/{id}", "{resource}", Some("id"), None, None, HashMap::new()),
             
         // User-specific resources
-        ("users/{userId}/{resource}", "resource", Some("resource"), 
+        ("users/{userId}/{resource}", "{resource}", Some("resource"), 
             Some("User"), Some("userId"), HashMap::new()),
-        ("users/{userId}/{resource}/{id}", "resource", Some("resource"), 
-            Some("User"), Some("userId"), {
-                let mut params = HashMap::new();
-                params.insert("id", "id");
-                params
-            }),
+        ("users/{userId}/{resource}/{id}", "{resource}", Some("id"), 
+            Some("User"), Some("userId"), HashMap::new()),
 
         // Nested resources
-        ("{parent}/{parentId}/{resource}", "resource", Some("resource"), 
-            Some("parent"), Some("parentId"), HashMap::new()),
-        ("{parent}/{parentId}/{resource}/{id}", "resource", Some("resource"), 
-            Some("parent"), Some("parentId"), {
-                let mut params = HashMap::new();
-                params.insert("id", "id");
-                params
-            }),
+        ("{parent}/{parentId}/{resource}", "{resource}", Some("resource"), 
+            Some("{parent}"), Some("parentId"), HashMap::new()),
+        ("{parent}/{parentId}/{resource}/{id}", "{resource}", Some("id"), 
+            Some("{parent}"), Some("parentId"), HashMap::new()),
     ];
     
     // Add each pattern

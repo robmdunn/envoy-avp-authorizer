@@ -152,9 +152,9 @@ struct ResourceMappingConfig {
 #[derive(Debug, Deserialize)]
 struct ResourceMappingPattern {
     pattern: String,
-    resource_type: String,
+    resource_type: String,  // Now can contain capture group references like "{resource}"
     resource_id_group: Option<String>,
-    parent_type: Option<String>,
+    parent_type: Option<String>,  // Now can contain capture group references like "{parent}"
     parent_id_group: Option<String>,
     parameter_groups: HashMap<String, String>,
 }

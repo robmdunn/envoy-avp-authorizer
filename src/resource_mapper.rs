@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use cedar_policy::{Context};
-use tracing::debug;
+use tracing::{debug, warn};
 use regex::{Regex, RegexSet};
 use thiserror::Error;
 
@@ -31,7 +31,7 @@ pub struct ResourcePath {
 
 impl ResourcePath {
     pub fn to_entity_uid(&self) -> String {
-        match (&self.resource_id, &self.parent_type, &self.parent_id) {
+        let result = match (&self.resource_id, &self.parent_type, &self.parent_id) {
             // Resource with ID, with parent
             (Some(id), Some(parent_type), Some(parent_id)) => {
                 format!("{}::{parent_type}::{parent_id}::{}", self.resource_type, id)
@@ -48,7 +48,9 @@ impl ResourcePath {
             _ => {
                 format!("{}Collection", self.resource_type)
             }
-        }
+        };
+        debug!("Converted ResourcePath to entity_uid: '{}'", result);
+        result
     }
     
     pub fn to_context(&self) -> Context {
@@ -104,12 +106,21 @@ pub struct ResourceMapper {
     pattern_set: RegexSet,
     default_action_map: HashMap<String, String>,
     custom_action_maps: Vec<(Regex, HashMap<String, String>)>,
+    api_prefix_regex: Regex,
 }
 
 impl ResourceMapper {
-    pub fn new() -> Self {
+    pub fn new(api_prefix_pattern: &str) -> Self {
         let patterns = Vec::new();
         let pattern_set = RegexSet::new([""]).unwrap(); // Dummy set, will be replaced
+        
+        // Convert wildcard pattern to regex (e.g., "/api/v*/" -> "^/api/v[^/]*/")
+        let api_prefix_regex_str = api_prefix_pattern
+            .replace("*", "[^/]*")
+            .replace("/", "\\/");
+        
+        let api_prefix_regex = Regex::new(&format!("^{}", api_prefix_regex_str))
+            .unwrap_or_else(|_| Regex::new("^/api/v[^/]*/").unwrap());
         
         // Default HTTP method to Cedar action mapping
         let default_action_map = {
@@ -129,9 +140,27 @@ impl ResourceMapper {
             pattern_set,
             default_action_map,
             custom_action_maps: Vec::new(),
+            api_prefix_regex,
         }
     }
     
+    pub fn get_patterns(&self) -> &[ResourcePattern] {
+        &self.patterns
+    }
+    
+    pub fn get_pattern_count(&self) -> usize {
+        self.patterns.len()
+    }
+    
+    // Pattern information helper method
+    pub fn get_patterns_info(&self) -> Vec<String> {
+        self.patterns.iter()
+            .map(|p| format!("'{}' -> type: '{}', id_group: {:?}, parent: {:?}/{:?}", 
+                            p.pattern, p.resource_type, p.resource_id_group, 
+                            p.parent_type, p.parent_id_group))
+            .collect()
+    }
+
     // Add a resource pattern for mapping
     pub fn add_pattern(
         &mut self,
@@ -219,22 +248,48 @@ impl ResourceMapper {
     
     // Parse a path into resource information
     pub fn parse_path(&self, path: &str) -> Result<ResourcePath, ResourceMappingError> {
-        // Remove API prefix if present
-        let clean_path = path.trim_start_matches("/api/v1").trim_start_matches('/');
+        // Add debug logging about the original path
+        debug!("Attempting to parse path: '{}'", path);
+        
+        // Remove API prefix if present using regex
+        let clean_path = if let Some(captures) = self.api_prefix_regex.captures(path) {
+            let matched_prefix = captures.get(0).map_or("", |m| m.as_str());
+            debug!("Found API prefix: '{}' in path", matched_prefix);
+            path.strip_prefix(matched_prefix).unwrap_or(path)
+        } else {
+            path.trim_start_matches('/')
+        };
+        
+        // Log if we modified the path
+        if clean_path != path {
+            debug!("Trimmed API prefix: '{}' -> '{}'", path, clean_path);
+        }
         
         // Try to match the path against our patterns
         let matches = self.pattern_set.matches(clean_path);
         
         if !matches.matched_any() {
-            debug!("No pattern matched path: {}", clean_path);
+            debug!("No pattern matched path: '{}' (cleaned: '{}')", path, clean_path);
+            debug!("Available patterns: {:?}", self.get_patterns_info());
             
             // Fall back to the default path parsing
+            debug!("Falling back to default path parsing");
             return self.default_parse_path(clean_path);
         }
         
-        // Find the first match
-        let pattern_index = matches.iter().next().unwrap();
+        // Find all matches for debugging
+        let match_indices: Vec<_> = matches.iter().collect();
+        debug!("Patterns matched for '{}': {:?} (using first match)", 
+            clean_path, 
+            match_indices.iter()
+                .map(|&i| format!("{} ({})", i, self.patterns[i].pattern))
+                .collect::<Vec<_>>());
+        
+        // Use the first match
+        let pattern_index = match_indices[0];
         let pattern = &self.patterns[pattern_index];
+        
+        debug!("Path '{}' matched pattern '{}'", clean_path, pattern.pattern);
         
         // Get the regex captures
         let captures = pattern.regex.captures(clean_path)
@@ -247,7 +302,9 @@ impl ResourceMapper {
         
         // Extract resource ID if present in the pattern
         let resource_id = pattern.resource_id_group.as_ref().and_then(|group| {
-            captures.name(group).map(|m| m.as_str().to_string())
+            let id = captures.name(group).map(|m| m.as_str().to_string());
+            debug!("Extracted resource_id: {:?} from group: {:?}", id, group);
+            id
         });
         
         // Extract parent type if present in the pattern
@@ -255,14 +312,20 @@ impl ResourceMapper {
         
         // Extract parent ID if present in the pattern
         let parent_id = pattern.parent_id_group.as_ref().and_then(|group| {
-            captures.name(group).map(|m| m.as_str().to_string())
+            let id = captures.name(group).map(|m| m.as_str().to_string());
+            debug!("Extracted parent_id: {:?} from group: {:?}", id, group);
+            id
         });
         
         // Extract additional parameters
         let mut parameters = HashMap::new();
         for (param_name, group_name) in &pattern.parameter_groups {
             if let Some(capture) = captures.name(group_name) {
-                parameters.insert(param_name.clone(), capture.as_str().to_string());
+                let value = capture.as_str().to_string();
+                debug!("Extracted parameter: {}={} from group: {}", param_name, value, group_name);
+                parameters.insert(param_name.clone(), value);
+            } else {
+                debug!("Failed to extract parameter: {} from group: {}", param_name, group_name);
             }
         }
         
@@ -332,10 +395,14 @@ impl ResourceMapper {
     
     // Map HTTP method to Cedar action based on resource info and custom mappings
     pub fn map_method_to_action(&self, method: &str, path: &str, resource_info: &ResourcePath) -> String {
+        debug!("Mapping method '{}' to action for path '{}'", method, path);
+        
         // Check if we have a custom action mapping for this path
         for (pattern, action_map) in &self.custom_action_maps {
             if pattern.is_match(path) {
+                debug!("Path '{}' matched custom action pattern", path);
                 if let Some(action) = action_map.get(&method.to_uppercase()) {
+                    debug!("Mapped method '{}' to custom action '{}'", method, action);
                     return format!("Action::\"{}\"", action);
                 }
             }
@@ -345,16 +412,29 @@ impl ResourceMapper {
         let base_action = self.default_action_map
             .get(&method.to_uppercase().to_string())
             .cloned()
-            .unwrap_or_else(|| "access".to_string());
+            .unwrap_or_else(|| {
+                debug!("No mapping found for method '{}', using default 'access'", method);
+                "access".to_string()
+            });
             
         // If it's a collection resource (no ID), adjust the action accordingly
         let action = match (&resource_info.resource_id, base_action.as_str()) {
-            (None, "read") => "list",
-            (None, "update") => "update_bulk",
-            (None, "delete") => "delete_bulk",
+            (None, "read") => {
+                debug!("Adjusted action from 'read' to 'list' for collection resource");
+                "list"
+            },
+            (None, "update") => {
+                debug!("Adjusted action from 'update' to 'update_bulk' for collection resource");
+                "update_bulk"
+            },
+            (None, "delete") => {
+                debug!("Adjusted action from 'delete' to 'delete_bulk' for collection resource");
+                "delete_bulk"
+            },
             _ => &base_action,
         };
         
+        debug!("Final mapped action: '{}' for method '{}' on path '{}'", action, method, path);
         format!("Action::\"{}\"", action)
     }
 
@@ -406,30 +486,32 @@ impl ResourceMapper {
 }
 
 // Default configuration for ResourceMapper
-pub fn create_default_resource_mapper() -> ResourceMapper {
-    let mut mapper = ResourceMapper::new();
+pub fn create_default_resource_mapper(api_prefix_pattern: &str) -> ResourceMapper {
+    let mut mapper = ResourceMapper::new(api_prefix_pattern);
     
-    // Add common REST API patterns
+    debug!("Using default patterns without API prefix for resource mappings");
+    
+    // Add common REST API patterns WITHOUT the prefix
     let patterns = [
         // Basic collection/item pattern
-        ("/api/v1/{resource}", "resource", Some("resource"), None, None, HashMap::new()),
-        ("/api/v1/{resource}/{id}", "resource", Some("resource"), Some("id"), None, HashMap::new()),
-        
-        // Nested resources
-        ("/api/v1/{parent}/{parentId}/{resource}", "resource", Some("resource"), 
-            Some("parent"), Some("parentId"), HashMap::new()),
-        ("/api/v1/{parent}/{parentId}/{resource}/{id}", "resource", Some("resource"), 
-            Some("parent"), Some("parentId"), {
+        ("{resource}", "resource", Some("resource"), None, None, HashMap::new()),
+        ("{resource}/{id}", "resource", Some("resource"), Some("id"), None, HashMap::new()),
+            
+        // User-specific resources
+        ("users/{userId}/{resource}", "resource", Some("resource"), 
+            Some("User"), Some("userId"), HashMap::new()),
+        ("users/{userId}/{resource}/{id}", "resource", Some("resource"), 
+            Some("User"), Some("userId"), {
                 let mut params = HashMap::new();
                 params.insert("id", "id");
                 params
             }),
-            
-        // User-specific resources
-        ("/api/v1/users/{userId}/{resource}", "resource", Some("resource"), 
-            Some("User"), Some("userId"), HashMap::new()),
-        ("/api/v1/users/{userId}/{resource}/{id}", "resource", Some("resource"), 
-            Some("User"), Some("userId"), {
+
+        // Nested resources
+        ("{parent}/{parentId}/{resource}", "resource", Some("resource"), 
+            Some("parent"), Some("parentId"), HashMap::new()),
+        ("{parent}/{parentId}/{resource}/{id}", "resource", Some("resource"), 
+            Some("parent"), Some("parentId"), {
                 let mut params = HashMap::new();
                 params.insert("id", "id");
                 params
@@ -438,20 +520,24 @@ pub fn create_default_resource_mapper() -> ResourceMapper {
     
     // Add each pattern
     for (pattern, resource_type, resource_id_group, parent_type, parent_id_group, params) in patterns {
-        mapper.add_pattern(
+        debug!("Adding default pattern: '{}'", pattern);
+        
+        if let Err(e) = mapper.add_pattern(
             pattern, 
             resource_type, 
             resource_id_group, 
             parent_type, 
             parent_id_group, 
             params,
-        ).unwrap();
+        ) {
+            warn!("Failed to add default pattern '{}': {}", pattern, e);
+        }
     }
     
-    // Add custom action mappings
+    // Add custom action mappings with the configurable prefix
     let custom_mappings = [
         // Example: Special endpoints for batch operations
-        ("/api/v1/{resource}/batch", {
+        ("{resource}/batch", {
             let mut map = HashMap::new();
             map.insert("POST", "batch_create");
             map.insert("PUT", "batch_update");
@@ -460,17 +546,17 @@ pub fn create_default_resource_mapper() -> ResourceMapper {
         }),
         
         // Example: Custom actions using POST with action in path
-        ("/api/v1/{resource}/{id}/publish", {
+        ("{resource}/{id}/publish", {
             let mut map = HashMap::new();
             map.insert("POST", "publish");
             map
         }),
-        ("/api/v1/{resource}/{id}/unpublish", {
+        ("{resource}/{id}/unpublish", {
             let mut map = HashMap::new();
             map.insert("POST", "unpublish");
             map
         }),
-        ("/api/v1/{resource}/{id}/archive", {
+        ("{resource}/{id}/archive", {
             let mut map = HashMap::new();
             map.insert("POST", "archive");
             map
@@ -479,7 +565,11 @@ pub fn create_default_resource_mapper() -> ResourceMapper {
     
     // Add each custom mapping
     for (pattern, action_map) in custom_mappings {
-        mapper.add_custom_action_mapping(pattern, action_map).unwrap();
+        debug!("Adding default action mapping for pattern: '{}'", pattern);
+        
+        if let Err(e) = mapper.add_custom_action_mapping(pattern, action_map) {
+            warn!("Failed to add default action mapping for '{}': {}", pattern, e);
+        }
     }
     
     mapper

@@ -112,7 +112,7 @@ impl AuthorizationCache {
         };
 
         let entry = AuthCacheEntry {
-            decision: result.decision().clone(),
+            decision: result.decision(),
             expires_at: Instant::now() + self.ttl,
             diagnostics: {
                 // Check if there are any errors in the diagnostics

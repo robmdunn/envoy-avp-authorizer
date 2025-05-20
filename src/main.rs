@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
-use tracing::{info, warn, debug, error, Level};
+use tracing::{debug, error, info, trace, warn, Level};
 use once_cell::sync::Lazy;
 use tokio::sync::mpsc;
 use serde::Deserialize;
@@ -49,7 +49,8 @@ type PolicyRefreshReceiver = mpsc::Receiver<()>;
 
 // Global resource mapper
 static RESOURCE_MAPPER: Lazy<RwLock<ResourceMapper>> = Lazy::new(|| {
-    RwLock::new(create_default_resource_mapper())
+    // Use a dummy value that will be replaced in main()
+    RwLock::new(ResourceMapper::new("/api/v*/"))
 });
 
 // Helper function to parse query parameters from URL
@@ -123,6 +124,10 @@ struct Args {
     /// Path to custom resource mapping configuration (optional)
     #[arg(long)]
     resource_mapping_path: Option<String>,
+
+    // API prefix pattern to be stripped
+    #[arg(long, default_value = "/api/v*/")]
+    api_prefix_pattern: String,
     
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, default_value = "info")]
@@ -321,10 +326,11 @@ impl AvpAuthorizationService {
         query_params: &HashMap<String, String>,
         headers: &HashMap<String, String>,
     ) -> Result<Response<CheckResponse>, Status> {
-        debug!("Using AVP API for authorization check");
+        debug!("Using AVP API for authorization check: path='{}', method='{}'", path, method);
         
         // Extract the action ID (e.g., "read" from "Action::\"read\"")
         let action_id = action.trim_start_matches("Action::\"").trim_end_matches("\"");
+        debug!("Extracted action_id: '{}' from action: '{}'", action_id, action);
         
         // Get the resource entity ID from resource info
         let resource_entity_id = resource_info.to_entity_uid();
@@ -333,6 +339,8 @@ impl AvpAuthorizationService {
         } else {
             format!("{}Collection", resource_info.resource_type)
         };
+        debug!("Using resource_entity_id: '{}', resource_entity_type: '{}'", 
+            resource_entity_id, resource_entity_type);
         
         // Create context from request information
         let context_pairs = self.create_context_map(method, path, query_params, headers, resource_info, claims);
@@ -1066,24 +1074,26 @@ async fn main() -> Result<()> {
         Telemetry::init();
     }
     
+
     // Load resource mapping configuration if provided
     if let Some(path) = &args.resource_mapping_path {
         info!("Loading resource mapping configuration from {}", path);
         match fs::read_to_string(path) {
             Ok(config_str) => {
+                trace!("Resource mapping config content: {}", config_str);
                 match serde_json::from_str::<ResourceMappingConfig>(&config_str) {
                     Ok(config) => {
-                        info!("Configuring custom resource mapping with {} patterns and {} action mappings", 
+                        info!("Found {} patterns and {} action mappings in configuration", 
                             config.patterns.len(), config.action_mappings.len());
                         
-                        let mut mapper = create_default_resource_mapper();
+                        // Always create a new empty mapper when config file is provided
+                        let mut mapper = ResourceMapper::new(&args.api_prefix_pattern);
+                        info!("Creating new mapper with custom configuration (default mappings will be ignored)");
                         
                         // Add custom patterns
-                        for pattern in config.patterns {
-                            let mut param_groups = HashMap::new();
-                            for (k, v) in &pattern.parameter_groups {
-                                param_groups.insert(k.clone(), v.clone());
-                            }
+                        for pattern in &config.patterns {
+                            debug!("Adding pattern: '{}' for resource_type: '{}'", 
+                                pattern.pattern, pattern.resource_type);
                             
                             let str_params: HashMap<&str, &str> = pattern.parameter_groups
                                 .iter()
@@ -1099,15 +1109,14 @@ async fn main() -> Result<()> {
                                 str_params,
                             ) {
                                 error!("Failed to add pattern '{}': {}", pattern.pattern, e);
+                            } else {
+                                debug!("Successfully added pattern: '{}'", pattern.pattern);
                             }
                         }
                         
                         // Add custom action mappings
-                        for mapping in config.action_mappings {
-                            let mut action_map = HashMap::new();
-                            for (k, v) in &mapping.mappings {
-                                action_map.insert(k.clone(), v.clone());
-                            }
+                        for mapping in &config.action_mappings {
+                            debug!("Adding action mapping for path: '{}'", mapping.path_pattern);
                             
                             let str_action_map: HashMap<&str, &str> = mapping.mappings
                                 .iter()
@@ -1119,12 +1128,24 @@ async fn main() -> Result<()> {
                                 str_action_map,
                             ) {
                                 error!("Failed to add action mapping for '{}': {}", mapping.path_pattern, e);
+                            } else {
+                                debug!("Successfully added action mapping for: '{}'", mapping.path_pattern);
                             }
                         }
                         
                         // Replace the global resource mapper
-                        let mut global_mapper = RESOURCE_MAPPER.write().await;
-                        *global_mapper = mapper;
+                        {
+                            let mut global_mapper = RESOURCE_MAPPER.write().await;
+                            *global_mapper = mapper;
+                        }
+                        
+                        // After replacing, dump all registered patterns for debugging
+                        {
+                            let mapper = RESOURCE_MAPPER.read().await;
+                            debug!("Resource mapper now has {} patterns configured", mapper.get_pattern_count());
+                            // Skip the detailed logging to avoid issues
+                            debug!("Resource mapping configured successfully");
+                        }
                         
                         info!("Custom resource mapping configured successfully");
                     },
@@ -1137,6 +1158,12 @@ async fn main() -> Result<()> {
                 error!("Failed to read resource mapping config file {}: {}", path, e);
             }
         }
+    } else {
+        // Initialize with default mappings if no config file provided
+        info!("No resource mapping configuration file provided, using default mappings");
+        let default_mapper = create_default_resource_mapper(&args.api_prefix_pattern);
+        let mut global_mapper = RESOURCE_MAPPER.write().await;
+        *global_mapper = default_mapper;
     }
     
     // Build the address to listen on

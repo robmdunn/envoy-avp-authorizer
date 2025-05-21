@@ -57,8 +57,7 @@ pub enum JwtError {
 // Structure to represent a cached JWK
 struct CachedJwk {
     key: DecodingKey,
-    algorithm: Algorithm,
-    expiry: Instant,
+    algorithm: Algorithm
 }
 
 // JWKS Cache to avoid excessive network requests
@@ -184,15 +183,11 @@ impl JwksCache {
                             continue;
                         }
                     };
-                    
-                    // Calculate cache expiry
-                    let expiry = Instant::now() + self.cache_duration;
-                    
+                                        
                     // Store the key in the cache
                     self.keys.insert(kid.to_string(), CachedJwk {
                         key: decoding_key,
-                        algorithm,
-                        expiry,
+                        algorithm
                     });
                     
                     debug!("Added key with kid '{}' to JWKS cache", kid);
@@ -253,14 +248,26 @@ impl JwtValidator {
     pub fn get_issuer(&self) -> &str {
         &self.issuer
     }
-    
-    pub async fn validate_token(&self, token: &str) -> Result<Claims, JwtError> {
 
+    pub async fn validate_token(&self, token: &str) -> Result<Claims, JwtError> {
         trace!("Validating JWT token for issuer: {}", self.issuer);
         
         // Decode JWT header to get the key ID
-        let header = decode_header(token)
-            .map_err(|e| JwtError::HeaderDecodeError(e.to_string()))?;
+        let header = match decode_header(token) {
+            Ok(h) => h,
+            Err(e) => {
+                // Map format errors to our InvalidFormat error
+                return match e.kind() {
+                    jsonwebtoken::errors::ErrorKind::InvalidToken => {
+                        Err(JwtError::InvalidFormat("Token is not a valid JWT".to_string()))
+                    },
+                    jsonwebtoken::errors::ErrorKind::InvalidSignature => {
+                        Err(JwtError::InvalidSignature("Token has invalid signature".to_string()))
+                    },
+                    _ => Err(JwtError::HeaderDecodeError(e.to_string())),
+                };
+            }
+        };
             
         let kid = header.kid.ok_or_else(|| 
             JwtError::HeaderDecodeError("No 'kid' found in JWT header".to_string()))?;
@@ -302,7 +309,33 @@ impl JwtValidator {
         validation.leeway = self.clock_skew_leeway.as_secs();
         
         // Decode and validate the token
-        let token_data = decode::<Claims>(token, &decoding_key, &validation)?;
+        let token_data = match decode::<Claims>(token, &decoding_key, &validation) {
+            Ok(data) => data,
+            Err(e) => {
+                // Map jsonwebtoken errors to our specific error types
+                return match e.kind() {
+                    jsonwebtoken::errors::ErrorKind::InvalidToken => {
+                        Err(JwtError::InvalidFormat("Token is not a valid JWT".to_string()))
+                    },
+                    jsonwebtoken::errors::ErrorKind::InvalidSignature => {
+                        Err(JwtError::InvalidSignature("Token signature verification failed".to_string()))
+                    },
+                    jsonwebtoken::errors::ErrorKind::InvalidIssuer => {
+                        Err(JwtError::InvalidIssuer)
+                    },
+                    jsonwebtoken::errors::ErrorKind::InvalidAudience => {
+                        Err(JwtError::InvalidAudience)
+                    },
+                    jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                        Err(JwtError::Expired)
+                    },
+                    jsonwebtoken::errors::ErrorKind::ImmatureSignature => {
+                        Err(JwtError::NotYetValid)
+                    },
+                    _ => Err(JwtError::JsonWebTokenError(e)),
+                }
+            }
+        };
         
         // Additional validation
         let claims = token_data.claims;

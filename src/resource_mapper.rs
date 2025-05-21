@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use cedar_policy::{Context};
 use tracing::{debug, info, trace, warn};
 use regex::{Regex, RegexSet};
 use thiserror::Error;
@@ -43,12 +42,6 @@ pub enum ResourceMappingError {
     
     #[error("Failed to match resource pattern: {0}")]
     PatternMatchFailed(String),
-    
-    #[error("Missing required path parameter: {0}")]
-    MissingParameter(String),
-
-    #[error("Failed to convert value to RestrictedExpression: {0}")]
-    ValueConversionError(String),
 }
 
 // ResourcePath stores the basic components of a resource
@@ -81,40 +74,6 @@ impl ResourcePath {
         };
         debug!("Converted ResourcePath to entity_uid: '{}'", result);
         result
-    }
-    
-    pub fn to_context(&self) -> Context {
-        // Create a simple HashMap of String -> String values
-        let mut context_pairs = HashMap::new();
-        
-        // Add basic resource information
-        context_pairs.insert("resource_type".to_string(), self.resource_type.clone());
-
-        if let Some(ref id) = self.resource_id {
-            context_pairs.insert("resource_id".to_string(), id.clone());
-        }
-        
-        if let Some(ref parent_type) = self.parent_type {
-            context_pairs.insert("parent_type".to_string(), parent_type.clone());
-        }
-        
-        if let Some(ref parent_id) = self.parent_id {
-            context_pairs.insert("parent_id".to_string(), parent_id.clone());
-        }
-        
-        // Add any additional parameters
-        for (key, value) in &self.parameters {
-            context_pairs.insert(format!("param_{}", key), value.clone());
-        }
-        
-        // Use Cedar's Context::from_json_str() method instead
-        match serde_json::to_string(&context_pairs) {
-            Ok(json_str) => match Context::from_json_str(&json_str, None) {
-                Ok(context) => context,
-                Err(_) => Context::empty(),
-            },
-            Err(_) => Context::empty(),
-        }
     }
 }
 
@@ -172,10 +131,6 @@ impl ResourceMapper {
             custom_action_maps: Vec::new(),
             api_prefix_regex,
         }
-    }
-    
-    pub fn get_patterns(&self) -> &[ResourcePattern] {
-        &self.patterns
     }
     
     pub fn get_pattern_count(&self) -> usize {
@@ -460,7 +415,7 @@ impl ResourceMapper {
     }
     
     // Map HTTP method to Cedar action based on resource info and custom mappings
-    pub fn map_method_to_action(&self, method: &str, path: &str, resource_info: &ResourcePath) -> String {
+    pub fn map_method_to_action(&self, method: &str, path: &str, _resource_info: &ResourcePath) -> String {
         debug!("Mapping method '{}' to action for path '{}'", method, path);
         
         // Clean up the path by removing the API prefix if present
@@ -504,52 +459,6 @@ impl ResourceMapper {
         
         debug!("Final mapped action: '{}' for method '{}' on path '{}'", action, method, path);
         format!("Action::\"{}\"", action)
-    }
-
-    // Create a Cedar context from HTTP request information
-    pub fn create_request_context(
-        &self,
-        method: &str,
-        path: &str,
-        query_params: &HashMap<String, String>,
-        headers: &HashMap<String, String>,
-    ) -> Context {
-        let mut context_pairs = HashMap::new();
-        
-        // Add HTTP method
-        context_pairs.insert("http_method".to_string(), method.to_string());
-        
-        // Add path
-        context_pairs.insert("http_path".to_string(), path.to_string());
-        
-        // Add query parameters with prefix
-        for (k, v) in query_params {
-            context_pairs.insert(format!("query_{}", k), v.clone());
-        }
-        
-        // Add selected headers (be careful not to include sensitive headers)
-        let safe_headers = vec![
-            "content-type", "accept", "accept-language", "x-request-id", 
-            "user-agent", "referer", "origin"
-        ];
-        
-        for header_name in safe_headers {
-            if let Some(value) = headers.get(header_name) {
-                context_pairs.insert(
-                    format!("header_{}", header_name.replace('-', "_")), 
-                    value.clone()
-                );
-            }
-        }
-        
-        // Same approach - use from_json_str
-        match serde_json::to_string(&context_pairs) {
-            Ok(json_str) => match Context::from_json_str(&json_str, None) {
-                Ok(context) => context,
-                Err(_) => Context::empty(),
-            },
-            Err(_) => Context::empty(),
-        }
     }
 }
 

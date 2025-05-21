@@ -7,8 +7,6 @@ const METRIC_AVP_REQUESTS_TOTAL: &str = "avp_requests_total";
 const METRIC_AVP_REQUEST_DURATION_SECONDS: &str = "avp_request_duration_seconds";
 const METRIC_JWT_VALIDATION_TOTAL: &str = "jwt_validation_total";
 const METRIC_JWT_VALIDATION_FAILURES: &str = "jwt_validation_failures";
-const METRIC_ENTITY_FETCH_TOTAL: &str = "entity_fetch_total";
-const METRIC_ENTITY_FETCH_FAILURES: &str = "entity_fetch_failures";
 const METRIC_ENTITY_FETCH_DURATION_SECONDS: &str = "entity_fetch_duration_seconds";
 const METRIC_CACHE_HITS: &str = "avp_cache_hits_total";
 const METRIC_CACHE_MISSES: &str = "avp_cache_misses_total";
@@ -64,29 +62,6 @@ impl Telemetry {
                 METRIC_JWT_VALIDATION_FAILURES,
                 "issuer" => issuer.to_string()
             ).increment(1);
-        }
-    }
-
-    // Record entity fetching
-    pub fn record_entity_fetch(entity_type: &str, success: bool) {
-        counter!(
-            METRIC_ENTITY_FETCH_TOTAL,
-            "entity_type" => entity_type.to_string()
-        ).increment(1);
-
-        if !success {
-            counter!(
-                METRIC_ENTITY_FETCH_FAILURES,
-                "entity_type" => entity_type.to_string()
-            ).increment(1);
-        }
-    }
-
-    // Time entity fetching
-    pub fn time_entity_fetch(entity_type: &str) -> EntityFetchTimer {
-        EntityFetchTimer {
-            start: Instant::now(),
-            entity_type: entity_type.to_string(),
         }
     }
 

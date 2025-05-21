@@ -3,13 +3,6 @@ use aws_config::BehaviorVersion;
 use aws_sdk_verifiedpermissions::Client as VerifiedPermissionsClient;
 use aws_sdk_verifiedpermissions::types::Decision;
 use aws_types::region::Region;
-use cedar_local_agent::public::simple::{Authorizer, AuthorizerConfigBuilder};
-use cedar_policy::{Request as CedarRequest, Schema};
-use cedar_policy::{Entities, EntityUid, Context};
-use avp_local_agent::public::{
-    entity_provider::EntityProvider,
-    policy_set_provider::PolicySetProvider,
-};
 use clap::Parser;
 use envoy_types::ext_authz::v3::CheckResponseExt;
 use envoy_types::ext_authz::v3::pb::{
@@ -23,7 +16,6 @@ use tokio::sync::RwLock;
 use tonic::{transport::Server, Request, Response, Status};
 use tracing::{debug, error, info, trace, warn, Level};
 use once_cell::sync::Lazy;
-use tokio::sync::mpsc;
 use serde::Deserialize;
 use std::fs;
 use url::Url;
@@ -35,15 +27,11 @@ mod telemetry;
 mod health;
 
 use jwt::{JwtValidator, JwtError, Claims};
-use auth_cache::AuthorizationCache;
+use auth_cache::{AuthorizationCache, Decision as CacheDecision, EntityUid};
 use resource_mapper::{ResourceMapper, create_default_resource_mapper};
 use telemetry::Telemetry;
 
 use crate::resource_mapper::ResourcePath;
-
-// Policy refresh channel for background refresh
-type PolicyRefreshSender = mpsc::Sender<()>;
-type PolicyRefreshReceiver = mpsc::Receiver<()>;
 
 // Global resource mapper
 static RESOURCE_MAPPER: Lazy<RwLock<ResourceMapper>> = Lazy::new(|| {
@@ -76,68 +64,56 @@ fn parse_query_params(path: &str) -> HashMap<String, String> {
 #[command(version, about, long_about = None)]
 struct Args {
     /// AWS region for Amazon Verified Permissions
-    #[arg(short, long, default_value = "us-east-1")]
+    #[arg(short, long, default_value = "us-east-1", env = "AVP_REGION")]
     region: String,
 
     /// Amazon Verified Permissions policy store ID
-    #[arg(short, long)]
+    #[arg(short, long, env = "AVP_POLICY_STORE_ID")]
     policy_store_id: String,
 
     /// Server address to listen on
-    #[arg(short, long, default_value = "0.0.0.0:50051")]
+    #[arg(short, long, default_value = "0.0.0.0:50051", env = "AVP_LISTEN_ADDRESS")]
     address: String,
     
     /// JWT issuer
-    #[arg(long, default_value = "https://your-identity-provider.com")]
+    #[arg(long, default_value = "https://your-identity-provider.com", env = "AVP_JWT_ISSUER")]
     jwt_issuer: String,
     
     /// JWT audience (optional)
-    #[arg(long)]
+    #[arg(long, env = "AVP_JWT_AUDIENCE")]
     jwt_audience: Option<String>,
     
     /// JWT JWKS URL for validation
-    #[arg(long, default_value = "https://your-identity-provider.com/.well-known/jwks.json")]
+    #[arg(long, default_value = "https://your-identity-provider.com/.well-known/jwks.json", env = "AVP_JWKS_URL")]
     jwks_url: String,
     
     /// JWKS cache duration in seconds
-    #[arg(long, default_value = "3600")]
+    #[arg(long, default_value = "3600", env = "AVP_JWKS_CACHE_DURATION")]
     jwks_cache_duration: u64,
     
     /// Policy cache TTL in seconds
-    #[arg(long, default_value = "60")]
+    #[arg(long, default_value = "60", env = "AVP_POLICY_CACHE_TTL")]
     policy_cache_ttl: u64,
     
     /// Maximum policy cache size
-    #[arg(long, default_value = "10000")]
+    #[arg(long, default_value = "10000", env = "AVP_POLICY_CACHE_SIZE")]
     policy_cache_size: usize,
     
-    /// Policy refresh interval in seconds
-    #[arg(long, default_value = "300")]
-    policy_refresh_interval: u64,
-    
-    /// Path to Cedar schema file (optional)
-    #[arg(long)]
-    schema_path: Option<String>,
-    
     /// Path to custom resource mapping configuration (optional)
-    #[arg(long)]
+    #[arg(long, env = "AVP_RESOURCE_MAPPING_PATH")]
     resource_mapping_path: Option<String>,
 
     // API prefix pattern to be stripped
-    #[arg(long, default_value = "/api/v*/")]
+    #[arg(long, default_value = "/api/v*/", env = "AVP_API_PREFIX_PATTERN")]
     api_prefix_pattern: String,
     
     /// Log level (trace, debug, info, warn, error)
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = "info", env = "AVP_LOG_LEVEL")]
     log_level: String,
     
     /// Enable metrics server (default port: 9000)
-    #[arg(long)]
+    #[arg(long, env = "AVP_ENABLE_METRICS")]
     enable_metrics: bool,
-
-    /// Enable local policy evaluation for high performance (requires local-evaluation feature)
-    #[arg(long)]
-    local_evaluation: bool,
 }
 
 // Configuration for resource mapping
@@ -165,19 +141,10 @@ struct ActionMapping {
 
 // Our authorization service implementation
 struct AvpAuthorizationService {
-    // Common fields for both approaches
     jwt_validator: JwtValidator,
     auth_cache: Arc<AuthorizationCache>,
     policy_store_id: String,
     avp_client: VerifiedPermissionsClient,
-    
-    // Fields used only with local evaluation
-    authorizer: Option<Arc<RwLock<Authorizer<PolicySetProvider, EntityProvider>>>>,
-    schema: Option<Schema>,
-    policy_refresh_sender: Option<PolicyRefreshSender>,
-    
-    // Flag to determine evaluation mode (always accessible)
-    use_local_evaluation: bool,
 }
 
 impl AvpAuthorizationService {
@@ -190,9 +157,7 @@ impl AvpAuthorizationService {
         jwks_cache_duration: Duration,
         policy_cache_ttl: Duration,
         policy_cache_size: usize,
-        schema_path: Option<String>,
-        use_local_evaluation: bool,
-    ) -> Result<(Self, Option<PolicyRefreshReceiver>)> {
+    ) -> Result<Self> {
         let aws_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
             .region(Region::new(region))
             .retry_config(aws_config::retry::RetryConfig::standard()
@@ -224,92 +189,12 @@ impl AvpAuthorizationService {
             policy_cache_size,
         ));
 
-        {
-            // Only set up local evaluation components if the feature is enabled and the flag is set
-            if use_local_evaluation {
-                info!("Using local policy evaluation");
-                let (policy_refresh_sender, policy_refresh_rx) = mpsc::channel::<()>(1);
-                
-                // Load schema if provided
-                let schema: Option<Schema> = if let Some(path) = schema_path {
-                    info!("Loading Cedar schema from {}", path);
-                    match fs::read_to_string(&path) {
-                        Ok(schema_str) => {
-                            match Schema::from_json_str(&schema_str) {
-                                Ok(schema) => {
-                                    info!("Successfully loaded Cedar schema");
-                                    Some(schema)
-                                },
-                                Err(e) => {
-                                    error!("Failed to parse Cedar schema: {}", e);
-                                    None
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            error!("Failed to read schema file {}: {}", path, e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                // Create policy provider from Amazon Verified Permissions
-                let policy_set_provider = PolicySetProvider::from_client(
-                    policy_store_id.clone(), 
-                    avp_client.clone()
-                )?;
-                
-                // Create entity provider from Amazon Verified Permissions
-                let entity_provider = EntityProvider::from_client(
-                    policy_store_id.clone(), 
-                    avp_client.clone()
-                )?;
-
-                // Create the authorizer configuration
-                let config = if let Some(_schema) = &schema {
-                    AuthorizerConfigBuilder::default()
-                        .policy_set_provider(Arc::new(policy_set_provider))
-                        .entity_provider(Arc::new(entity_provider))
-                        .build()
-                        .unwrap()
-                } else {
-                    AuthorizerConfigBuilder::default()
-                        .policy_set_provider(Arc::new(policy_set_provider))
-                        .entity_provider(Arc::new(entity_provider))
-                        .build()
-                        .unwrap()
-                };
-        
-                // Create the authorizer
-                let authorizer = Authorizer::new(config);
-        
-                return Ok((Self {
-                    jwt_validator,
-                    auth_cache,
-                    policy_store_id,
-                    avp_client,
-                    authorizer: Some(Arc::new(RwLock::new(authorizer))),
-                    schema,
-                    policy_refresh_sender: Some(policy_refresh_sender),
-                    use_local_evaluation: true,
-                }, Some(policy_refresh_rx)));
-            } else {
-                // Local evaluation feature available but not enabled
-                info!("Using AVP API for authorization");
-                return Ok((Self {
-                    jwt_validator,
-                    auth_cache,
-                    policy_store_id,
-                    avp_client,
-                    authorizer: None::<Arc<RwLock<Authorizer<PolicySetProvider, EntityProvider>>>>,
-                    schema: None,
-                    policy_refresh_sender: None,
-                    use_local_evaluation: false,
-                }, None));
-            }
-        }
+        Ok(Self {
+            jwt_validator,
+            auth_cache,
+            policy_store_id,
+            avp_client,
+        })
     }
 
     // AVP API based check
@@ -354,13 +239,11 @@ impl AvpAuthorizationService {
         let context_hash = AuthorizationCache::compute_context_hash(&format!("{:?}", context_pairs));
         let principal_id = claims.sub.clone();
         let principal = format!("User::\"{principal_id}\"");
-        let principal_entity = principal.parse::<cedar_policy::EntityUid>()
-            .unwrap_or_else(|_| "User::\"unknown\"".parse().unwrap());
-        let action_entity = action.parse::<cedar_policy::EntityUid>()
-            .unwrap_or_else(|_| "Action::\"unknown\"".parse().unwrap());
-        let resource_entity = format!("Resource::\"{}\"", resource_entity_id)
-            .parse::<cedar_policy::EntityUid>()
-            .unwrap_or_else(|_| "Resource::\"unknown\"".parse().unwrap());
+        
+        // Create EntityUid objects using our custom type
+        let principal_entity = EntityUid::new(principal.clone());
+        let action_entity = EntityUid::new(action.clone());
+        let resource_entity = EntityUid::new(format!("Resource::\"{}\"", resource_entity_id.clone()));
                 
         // Try to get result from cache first
         if let Some((cached_decision, diagnostics)) = self.auth_cache.get(
@@ -373,7 +256,7 @@ impl AvpAuthorizationService {
             debug!("Using cached authorization decision: {:?}", cached_decision);
             
             // Return the cached decision
-            if cached_decision == cedar_policy::Decision::Allow {
+            if cached_decision == CacheDecision::Allow {
                 info!("Authorization allowed (cached): principal={}, action={}, resource={}", 
                     principal, action, resource_entity_id);
                 
@@ -397,54 +280,44 @@ impl AvpAuthorizationService {
             }
         } else {
             Telemetry::record_cache_miss();
-            
-        // Get the resource entity ID from resource info
-        let resource_entity_id = resource_info.to_entity_uid();
 
-        // Call AVP's IsAuthorizedWithToken API
-        let eval_timer = Telemetry::time_cedar_evaluation();
+            // Call AVP's IsAuthorizedWithToken API
+            let eval_timer = Telemetry::time_cedar_evaluation();
 
-        let auth_result = self.avp_client
-            .is_authorized_with_token()
-            .policy_store_id(&self.policy_store_id)
-            .identity_token(token)
-            .action(aws_sdk_verifiedpermissions::types::ActionIdentifier::builder()
-                .action_id(action_id)
-                .action_type("Action")
-                .build()
+            let auth_result = self.avp_client
+                .is_authorized_with_token()
+                .policy_store_id(&self.policy_store_id)
+                .identity_token(token)
+                .action(aws_sdk_verifiedpermissions::types::ActionIdentifier::builder()
+                    .action_id(action_id)
+                    .action_type("Action")
+                    .build()
+                    .map_err(|e| {
+                        error!("Failed to build action identifier: {}", e);
+                        Status::internal("Failed to build action identifier")
+                    })?)
+                .resource(aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
+                    .entity_id(resource_entity_id.clone()) // Clone here
+                    .entity_type(resource_entity_type)
+                    .build()
+                    .map_err(|e| {
+                        error!("Failed to build entity identifier: {}", e);
+                        Status::internal("Failed to build entity identifier")
+                    })?)
+                .context(avp_context)
+                .send()
+                .await
                 .map_err(|e| {
-                    error!("Failed to build action identifier: {}", e);
-                    Status::internal("Failed to build action identifier")
-                })?)
-            .resource(aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
-                .entity_id(resource_entity_id.clone()) // Clone here
-                .entity_type(resource_entity_type)
-                .build()
-                .map_err(|e| {
-                    error!("Failed to build entity identifier: {}", e);
-                    Status::internal("Failed to build entity identifier")
-                })?)
-            .context(avp_context)
-            .send()
-            .await
-            .map_err(|e| {
-                error!("AVP authorization error: {} ({:?})", e, e);
-                if let aws_sdk_verifiedpermissions::error::SdkError::ServiceError(service_err) = &e {
-                    error!("Service error details: {:?}", service_err);
-                }
-                Status::internal(format!("Authorization service error: {}", e))
-            })?;
-            
+                    error!("AVP authorization error: {} ({:?})", e, e);
+                    if let aws_sdk_verifiedpermissions::error::SdkError::ServiceError(service_err) = &e {
+                        error!("Service error details: {:?}", service_err);
+                    }
+                    Status::internal(format!("Authorization service error: {}", e))
+                })?;
+                
             // End the evaluation timer
             drop(eval_timer);
                 
-                // // Create a CedarResponse object that combines the decision and diagnostics
-                // let cedar_decision = if *auth_result.decision() == Decision::Allow {
-                //     cedar_policy::Decision::Allow
-                // } else {
-                //     cedar_policy::Decision::Deny
-                // };
-            
             // Extract any errors for diagnostics
             let errors_vec: Vec<String> = auth_result.errors().iter()
                 .map(|e| {
@@ -583,310 +456,6 @@ impl AvpAuthorizationService {
         
         context_pairs
     }
-    
-    async fn check_with_local_evaluation(
-        &self,
-        claims: &Claims,
-        method: &str,
-        path: &str,
-        resource_info: &ResourcePath,
-        action: String,
-        query_params: &HashMap<String, String>,
-        headers: &HashMap<String, String>,
-    ) -> Result<Response<CheckResponse>, Status> {
-        debug!("Using local policy evaluation");
-        
-        // Use the validated subject from JWT as principal ID
-        let principal_id = claims.sub.clone();
-        let principal = format!("User::\"{principal_id}\"");
-        let principal_entity: EntityUid = principal.parse().unwrap();
-        
-        // Parse action
-        let action_entity: EntityUid = action.parse().unwrap();
-        
-        // Get resource entity from path information
-        let resource = format!("Resource::\"{}\"", resource_info.to_entity_uid());
-        let resource_entity: EntityUid = resource.parse().unwrap();
-        
-        // Original context creation logic
-        let merged_context = {
-            // Create context map
-            let context_pairs = self.create_context_map(
-                method, path, query_params, headers, resource_info, claims
-            );
-            
-            // Convert to Cedar Context
-            match serde_json::to_string(&context_pairs) {
-                Ok(json_str) => match Context::from_json_str(&json_str, None) {
-                    Ok(context) => context,
-                    Err(e) => {
-                        debug!("Failed to create context from JSON: {}", e);
-                        Context::empty()
-                    }
-                },
-                Err(e) => {
-                    debug!("Failed to serialize context to JSON: {}", e);
-                    Context::empty()
-                }
-            }
-        };
-        
-        // Compute context hash for cache key
-        let context_hash = AuthorizationCache::compute_context_hash(&format!("{:?}", merged_context));
-
-        debug!("Checking authorization: principal={}, action={}, resource={}", 
-            principal, action, resource);
-
-        // Try to get result from cache first
-        if let Some((decision, diagnostics)) = self.auth_cache.get(
-            &principal_entity, 
-            &action_entity, 
-            &resource_entity, 
-            context_hash
-        ).await {
-            Telemetry::record_cache_hit();
-            
-            debug!("Using cached authorization decision: {:?}", decision);
-            
-            // Return the cached decision
-            return if matches!(decision, cedar_policy::Decision::Allow) {
-                info!("Authorization allowed (cached): principal={}, action={}, resource={}", 
-                    principal, action, resource);
-                
-                Ok(Response::new(CheckResponse::with_status(
-                    Status::ok("Request authorized"),
-                )))
-            } else {
-                warn!("Authorization denied (cached): principal={}, action={}, resource={}", 
-                    principal, action, resource);
-                
-                // Include diagnostics if available
-                let message = if let Some(diag) = diagnostics {
-                    format!("Request not authorized: {}", diag)
-                } else {
-                    "Request not authorized".to_string()
-                };
-                
-                Ok(Response::new(CheckResponse::with_status(
-                    Status::permission_denied(message),
-                )))
-            };
-        }
-        
-        Telemetry::record_cache_miss();
-        
-        // Create Cedar request
-        let cedar_request = CedarRequest::new(
-            principal_entity.clone(),
-            action_entity.clone(),
-            resource_entity.clone(),
-            merged_context,
-            None,
-        ).unwrap();
-
-        trace!("Creating Cedar request: principal={}, action={}, resource={}", 
-            principal_entity, action_entity, resource_entity);
-
-        // Get entities for this request
-        let entities = match self.get_entities_for_request(claims, resource_info).await {
-            Ok(e) => e,
-            Err(status) => {
-                warn!("Failed to get entities for request: {:?}", status);
-                return Ok(Response::new(CheckResponse::with_status(status)));
-            }
-        };
-
-        // Time the Cedar policy evaluation
-        let eval_timer = Telemetry::time_cedar_evaluation();
-        
-        // Safely unwrap the authorizer since we've verified we're in local eval mode
-        let authorizer = self.authorizer.as_ref().unwrap();
-        
-        // Perform the authorization check with the entities
-        let auth_result = match authorizer.read().await.is_authorized(&cedar_request, &entities).await {
-            Ok(result) => result,
-            Err(err) => {
-                error!("Authorization error: {}", err);
-                return Ok(Response::new(CheckResponse::with_status(
-                    Status::internal("Authorization system error"),
-                )));
-            }
-        };
-        
-        // End the evaluation timer
-        drop(eval_timer);
-        
-        // Cache the authorization result
-        self.auth_cache.put(
-            &principal_entity, 
-            &action_entity, 
-            &resource_entity, 
-            context_hash, 
-            &auth_result
-        ).await;
-        
-        // Check the decision
-        if matches!(auth_result.decision(), cedar_policy::Decision::Allow) {
-            info!("Authorization allowed: principal={}, action={}, resource={}", 
-                principal, action, resource);
-            
-            // Record the metric
-            Telemetry::record_request(method, path, "allowed");
-            
-            // Allow the request and add any custom headers if needed
-            Ok(Response::new(CheckResponse::with_status(
-                Status::ok("Request authorized"),
-            )))
-        } else {
-            warn!("Authorization denied: principal={}, action={}, resource={}", 
-                principal, action, resource);
-            
-            // Record the metric
-            Telemetry::record_request(method, path, "denied");
-            
-            // Get diagnostics for better error messages
-            let message = if auth_result.diagnostics().errors().next().is_some() {
-                let errors = auth_result.diagnostics().errors()
-                    .map(|e| e.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                format!("Request not authorized: {}", errors)
-            } else {
-                "Request not authorized".to_string()
-            };
-            
-            // Deny the request
-            Ok(Response::new(CheckResponse::with_status(
-                Status::permission_denied(message),
-            )))
-        }
-    }
-    
-    // Method to fetch entities for Cedar authorization
-    async fn get_entities_for_request(
-        &self, 
-        claims: &Claims,
-        resource_info: &resource_mapper::ResourcePath
-    ) -> Result<Entities, Status> {
-        let timer = Telemetry::time_entity_fetch(&resource_info.resource_type);
-        
-        // Get a list of entity UIDs we need to fetch
-        let mut entity_uids = Vec::new();
-        
-        // User principal entity
-        let principal_uid: EntityUid = format!("User::\"{}\"", claims.sub).parse()
-            .map_err(|e| {
-                Telemetry::record_entity_fetch("User", false);
-                error!("Failed to parse principal UID: {}", e);
-                Status::internal("Failed to parse principal UID")
-            })?;
-        
-        entity_uids.push(principal_uid.clone());
-        
-        // Resource entity if it has an ID
-        if let Some(id) = &resource_info.resource_id {
-            let resource_uid: EntityUid = format!("Resource::\"{}::{}\"", 
-                resource_info.resource_type, id).parse()
-                .map_err(|e| {
-                    Telemetry::record_entity_fetch(&resource_info.resource_type, false);
-                    error!("Failed to parse resource UID: {}", e);
-                    Status::internal("Failed to parse resource UID")
-                })?;
-                
-            entity_uids.push(resource_uid);
-        }
-        
-        // Parent resource if applicable
-        if let (Some(parent_type), Some(parent_id)) = (&resource_info.parent_type, &resource_info.parent_id) {
-            let parent_uid: EntityUid = format!("Resource::\"{}::{}\"", 
-                parent_type, parent_id).parse()
-                .map_err(|e| {
-                    Telemetry::record_entity_fetch(parent_type, false);
-                    error!("Failed to parse parent resource UID: {}", e);
-                    Status::internal("Failed to parse parent resource UID")
-                })?;
-                
-            entity_uids.push(parent_uid);
-        }
-        
-        // Use the Entities from Authorizer.is_authorized() instead
-        let entities = Entities::empty();
-        
-        // Record successful entity fetch
-        for uid in &entity_uids {
-            // Use namespace_components from paste-3.txt to get entity type
-            let entity_type = match uid.id().unescaped() {
-                s if s.contains("::") => s.split("::").next().unwrap_or("Unknown").to_string(),
-                _ => "Unknown".to_string()
-            };
-            Telemetry::record_entity_fetch(&entity_type, true);
-        }
-        
-        // Drop the timer
-        drop(timer);
-        
-        Ok(entities)
-    }
-    
-    // Background task for policy refreshing
-    async fn run_policy_refresh_task(
-        authorizer: Arc<RwLock<Authorizer<PolicySetProvider, EntityProvider>>>,
-        auth_cache: Arc<AuthorizationCache>,
-        mut rx: PolicyRefreshReceiver,
-        interval: Duration,
-    ) {
-        info!("Starting policy refresh background task");
-        
-        // Create a ticker for periodic refresh
-        let mut interval_timer = tokio::time::interval(interval);
-        
-        loop {
-            tokio::select! {
-                // Handle manual refresh requests
-                _ = rx.recv() => {
-                    debug!("Received manual policy refresh request");
-                    Self::refresh_policies(&authorizer, &auth_cache).await;
-                }
-                
-                // Handle periodic refresh
-                _ = interval_timer.tick() => {
-                    debug!("Periodic policy refresh triggered");
-                    Self::refresh_policies(&authorizer, &auth_cache).await;
-                }
-            }
-        }
-    }
-    
-    // Refresh policies and entities
-    async fn refresh_policies(
-        authorizer: &Arc<RwLock<Authorizer<PolicySetProvider, EntityProvider>>>,
-        auth_cache: &Arc<AuthorizationCache>,
-    ) {
-        debug!("Refreshing policies and entities");
-        
-        // Use CedarRequest to clearly indicate this is Cedar's Request type, not Tonic's
-        match CedarRequest::new(
-            "User::\"refresh\"".parse().unwrap(),
-            "Action::\"refresh\"".parse().unwrap(),
-            "Resource::\"system\"".parse().unwrap(),
-            Context::empty(),
-            None,
-        ) {
-            Ok(refresh_req) => {
-                // This will trigger policy and entity provider to fetch fresh data
-                let _ = authorizer.read().await.is_authorized(&refresh_req, &Entities::empty()).await;
-                info!("Successfully refreshed policy set and entities");
-            },
-            Err(e) => {
-                error!("Failed to create refresh request: {}", e);
-            }
-        }
-        
-        // Clear the authorization cache
-        auth_cache.clear().await;
-        
-        debug!("Policy and entity refresh completed");
-    }
 }
 
 #[tonic::async_trait]
@@ -1017,13 +586,8 @@ impl Authorization for AvpAuthorizationService {
         // Map HTTP method to Cedar action
         let action = resource_mapper.map_method_to_action(&method, &path, &resource_info);
         
-        // Branch based on evaluation mode
-        if !self.use_local_evaluation {
-            // Use AVP API directly
-            return self.check_with_avp_api(token, &claims, &method, &path, &resource_info, action, &query_params, &headers).await;
-        } else {
-            return self.check_with_local_evaluation(&claims, &method, &path, &resource_info, action, &query_params, &headers).await;
-        }
+        // Use AVP API directly
+        return self.check_with_avp_api(token, &claims, &method, &path, &resource_info, action, &query_params, &headers).await;
     }
 }
 
@@ -1151,7 +715,7 @@ async fn main() -> Result<()> {
     info!("Initializing AVP authorization service");
     
     // Create the service with appropriate mode
-    let (avp_auth_service, policy_refresh_rx) = AvpAuthorizationService::new(
+    let avp_auth_service = AvpAuthorizationService::new(
         args.region, 
         args.policy_store_id.clone(),
         args.jwt_issuer.clone(),
@@ -1160,25 +724,7 @@ async fn main() -> Result<()> {
         Duration::from_secs(args.jwks_cache_duration),
         Duration::from_secs(args.policy_cache_ttl),
         args.policy_cache_size,
-        args.schema_path,
-        args.local_evaluation,
     ).await?;
-    
-    // Start the policy refresh background task if needed
-    if let Some(rx) = policy_refresh_rx {
-        let authorizer_clone = avp_auth_service.authorizer.clone().unwrap();
-        let auth_cache_clone = avp_auth_service.auth_cache.clone();
-        let policy_refresh_interval = Duration::from_secs(args.policy_refresh_interval);
-        
-        tokio::spawn(async move {
-            AvpAuthorizationService::run_policy_refresh_task(
-                authorizer_clone,
-                auth_cache_clone,
-                rx,
-                policy_refresh_interval,
-            ).await;
-        });
-    }
     
     info!("Starting gRPC server on {}", addr);
     Server::builder()

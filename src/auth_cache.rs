@@ -1,9 +1,41 @@
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use cedar_policy::{EntityUid, Response as CedarResponse, Decision};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, info};
+
+// Enum to represent authorization decisions
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    Allow,
+    Deny,
+}
+
+// Simple EntityUid replacement
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityUid {
+    value: String
+}
+
+impl EntityUid {
+    pub fn new(value: String) -> Self {
+        EntityUid { value }
+    }
+}
+
+impl std::fmt::Display for EntityUid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.value)
+    }
+}
+
+impl std::str::FromStr for EntityUid {
+    type Err = String;
+    
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(EntityUid::new(s.to_string()))
+    }
+}
 
 // Define a struct to represent a cache key
 #[derive(Debug, Clone, Eq)]
@@ -85,7 +117,7 @@ impl AuthorizationCache {
         if let Some(entry) = cache.get(&key) {
             if entry.expires_at > Instant::now() {
                 trace!("Cache hit for {}/{}/{}", principal, action, resource);
-                return Some((entry.decision, entry.diagnostics.clone()));
+                return Some((entry.decision.clone(), entry.diagnostics.clone()));
             } else {
                 trace!("Cache entry expired for {}/{}/{}", principal, action, resource);
             }
@@ -94,81 +126,6 @@ impl AuthorizationCache {
         }
         
         None
-    }
-
-    // Store a decision in the cache
-    pub async fn put(
-        &self,
-        principal: &EntityUid,
-        action: &EntityUid,
-        resource: &EntityUid,
-        context_hash: u64,
-        result: &CedarResponse,
-    ) {
-        let key = AuthCacheKey {
-            principal: principal.to_string(),
-            action: action.to_string(),
-            resource: resource.to_string(),
-            context_hash,
-        };
-
-        let entry = AuthCacheEntry {
-            decision: result.decision(),
-            expires_at: Instant::now() + self.ttl,
-            diagnostics: {
-                // Check if there are any errors in the diagnostics
-                let diag = result.diagnostics();
-                if diag.errors().next().is_some() {
-                    // We have errors, convert them to a simple string representation
-                    let error_string = diag.errors()
-                        .map(|err| err.to_string())
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    Some(error_string)
-                } else {
-                    None
-                }
-            },
-        };
-
-        trace!("Storing decision in cache for {}/{}/{}", principal, action, resource);
-
-        let mut cache = self.cache.write().await;
-        
-        // Check if we need to evict entries (simple approach: clear half the cache when full)
-        if cache.len() >= self.max_size {
-            info!("Authorization cache full, evicting entries");
-            
-            // Collect keys to remove (expired entries + oldest entries if needed)
-            let now = Instant::now();
-            let mut entries: Vec<_> = cache.iter()
-                .map(|(k, v)| (k.clone(), v.expires_at))
-                .collect();
-            
-            // Sort by expiration time (expired first, then oldest)
-            entries.sort_by_key(|(_k, exp)| *exp);
-            
-            // Remove expired entries first
-            let expired_count = entries.iter().take_while(|(_k, exp)| *exp <= now).count();
-            
-            // If no expired entries or not enough space freed, remove oldest entries up to half the cache
-            let remove_count = if expired_count > 0 {
-                expired_count
-            } else {
-                self.max_size / 10
-            };
-            
-            // Remove the selected entries
-            for (k, _) in entries.into_iter().take(remove_count) {
-                cache.remove(&k);
-            }
-            
-            info!("Evicted {} entries from authorization cache", remove_count);
-        }
-
-        // Add the new entry
-        cache.insert(key, entry);
-        debug!("Cached authorization decision for {}/{}/{}", principal, action, resource);
     }
 
     // Store a decision in the cache using AWS types
@@ -181,6 +138,7 @@ impl AuthorizationCache {
         aws_decision: aws_sdk_verifiedpermissions::types::Decision,
         diagnostics: Option<String>,
     ) {
+        // Create cache key
         let key = AuthCacheKey {
             principal: principal.to_string(),
             action: action.to_string(),
@@ -188,49 +146,24 @@ impl AuthorizationCache {
             context_hash,
         };
 
-        // Convert AWS decision to Cedar decision
-        let cedar_decision = match aws_decision {
+        // Convert AWS decision to our Decision enum
+        let decision = match aws_decision {
             aws_sdk_verifiedpermissions::types::Decision::Allow => Decision::Allow,
             _ => Decision::Deny,
         };
 
         let entry = AuthCacheEntry {
-            decision: cedar_decision,
+            decision,
             expires_at: Instant::now() + self.ttl,
             diagnostics,
         };
 
+        // Acquire write lock
         let mut cache = self.cache.write().await;
         
-        // Check if we need to evict entries (simple approach: clear half the cache when full)
+        // More efficient cache eviction when full - only evict if we've reached max size
         if cache.len() >= self.max_size {
-            info!("Authorization cache full, evicting entries");
-            
-            // Collect keys to remove (expired entries + oldest entries if needed)
-            let now = Instant::now();
-            let mut entries: Vec<_> = cache.iter()
-                .map(|(k, v)| (k.clone(), v.expires_at))
-                .collect();
-            
-            // Sort by expiration time (expired first, then oldest)
-            entries.sort_by_key(|(_k, exp)| *exp);
-            
-            // Remove expired entries first
-            let expired_count = entries.iter().take_while(|(_k, exp)| *exp <= now).count();
-            
-            // If no expired entries or not enough space freed, remove oldest entries up to half the cache
-            let remove_count = if expired_count > 0 {
-                expired_count
-            } else {
-                self.max_size / 10
-            };
-            
-            // Remove the selected entries
-            for (k, _) in entries.into_iter().take(remove_count) {
-                cache.remove(&k);
-            }
-            
-            info!("Evicted {} entries from authorization cache", remove_count);
+            self.evict_entries(&mut cache).await;
         }
 
         // Add the new entry
@@ -238,12 +171,47 @@ impl AuthorizationCache {
         debug!("Cached authorization decision for {}/{}/{}", principal, action, resource);
     }
 
-    // Remove all entries from the cache
-    pub async fn clear(&self) {
-        let mut cache = self.cache.write().await;
-        let count = cache.len();
-        cache.clear();
-        info!("Cleared {} entries from authorization cache", count);
+    async fn evict_entries(&self, cache: &mut tokio::sync::RwLockWriteGuard<'_, HashMap<AuthCacheKey, AuthCacheEntry>>) {
+        info!("Authorization cache full, evicting entries");
+        
+        // First pass: remove expired entries
+        let now = Instant::now();
+        let mut expired_count = 0;
+        
+        cache.retain(|_, entry| {
+            let expired = entry.expires_at <= now;
+            if expired {
+                expired_count += 1;
+            }
+            !expired
+        });
+        
+        // If we removed some expired entries, we're done
+        if expired_count > 0 {
+            info!("Evicted {} expired entries from authorization cache", expired_count);
+            return;
+        }
+        
+        // Second pass: if no expired entries, remove the oldest entries (10% of cache)
+        let remove_count = self.max_size / 10;
+        if remove_count == 0 {
+            return;
+        }
+        
+        // Sort by expiration time to get the oldest entries
+        let mut entries: Vec<_> = cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.expires_at))
+            .collect();
+        
+        // Sort by expiration time (oldest first)
+        entries.sort_by_key(|(_k, exp)| *exp);
+        
+        // Remove the oldest entries
+        for (k, _) in entries.into_iter().take(remove_count) {
+            cache.remove(&k);
+        }
+        
+        info!("Evicted {} oldest entries from authorization cache", remove_count);
     }
-
 }

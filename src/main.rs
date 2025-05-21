@@ -209,7 +209,7 @@ impl AvpAuthorizationService {
         query_params: &HashMap<String, String>,
         headers: &HashMap<String, String>,
     ) -> Result<Response<CheckResponse>, Status> {
-        debug!("Using AVP API for authorization check: path='{}', method='{}'", path, method);
+        trace!("Using AVP API for authorization check: path='{}', method='{}'", path, method);
         
         // Extract the action ID (e.g., "read" from "Action::\"read\"")
         let action_id = action.trim_start_matches("Action::\"").trim_end_matches("\"");
@@ -223,7 +223,7 @@ impl AvpAuthorizationService {
         
         // Create context from request information
         let context_pairs = self.create_context_map(method, path, query_params, headers, resource_info, claims);
-        
+
         // Convert to AVP context format
         let avp_context = match serde_json::to_string(&context_pairs) {
             Ok(json_str) => {
@@ -236,7 +236,12 @@ impl AvpAuthorizationService {
         };
         
         // Compute cache key for potential caching
-        let context_hash = AuthorizationCache::compute_context_hash(&format!("{:?}", context_pairs));
+        let stable_context = AvpAuthorizationService::create_stable_context_representation(&context_pairs);
+        trace!("Context pairs for request: {:#?}", stable_context);
+
+        let context_hash = AuthorizationCache::compute_context_hash(&stable_context);
+        debug!("Context hash for request: {} ({} context pairs)", context_hash, context_pairs.len());
+
         let principal_id = claims.sub.clone();
         let principal = format!("User::\"{principal_id}\"");
         
@@ -253,7 +258,6 @@ impl AvpAuthorizationService {
             context_hash
         ).await {
             Telemetry::record_cache_hit();
-            debug!("Using cached authorization decision: {:?}", cached_decision);
             
             // Return the cached decision
             if cached_decision == CacheDecision::Allow {
@@ -282,7 +286,7 @@ impl AvpAuthorizationService {
             Telemetry::record_cache_miss();
 
             // Call AVP's IsAuthorizedWithToken API
-            let eval_timer = Telemetry::time_cedar_evaluation();
+            let eval_timer = Telemetry::time_avp_request();
 
             let auth_result = self.avp_client
                 .is_authorized_with_token()
@@ -378,7 +382,25 @@ impl AvpAuthorizationService {
         }
     }
     
-    // Helper method to create context map for both implementations
+    fn create_stable_context_representation(context: &HashMap<String, serde_json::Value>) -> String {
+        let mut keys: Vec<&String> = context.keys().collect();
+        keys.sort(); // Sort keys for stable order
+        
+        let mut parts = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(value) = context.get(key) {
+                // Convert value to a stable string representation
+                let value_str = match value {
+                    serde_json::Value::String(s) => s.clone(),
+                    _ => value.to_string(),
+                };
+                parts.push(format!("{}={}", key, value_str));
+            }
+        }
+        
+        parts.join(";")
+    }
+
     fn create_context_map(
         &self,
         method: &str,
@@ -388,7 +410,6 @@ impl AvpAuthorizationService {
         resource_info: &ResourcePath, 
         claims: &Claims,
     ) -> HashMap<String, serde_json::Value> {
-        // Create a simple HashMap for context
         let mut context_pairs = HashMap::new();
         
         // Add basic request information
@@ -402,13 +423,24 @@ impl AvpAuthorizationService {
                 serde_json::Value::String(v.clone())
             );
         }
+
+        // Add selected headers, EXCLUDING transient headers like x-request-id
+        let excluded_headers = [
+            "x-request-id", 
+            "x-b3-traceid", 
+            "x-b3-spanid",
+            "x-b3-parentspanid",
+            "x-envoy-attempt-count",
+        ];
         
-        // Add selected headers
         for (k, v) in headers {
-            context_pairs.insert(
-                format!("header_{}", k.replace('-', "_")), 
-                serde_json::Value::String(v.clone())
-            );
+            let lower_k = k.to_lowercase();
+            if !excluded_headers.iter().any(|&h| lower_k.contains(h)) {
+                context_pairs.insert(
+                    format!("header_{}", lower_k.replace('-', "_")), 
+                    serde_json::Value::String(v.clone())
+                );
+            }
         }
         
         // Add resource information
@@ -456,6 +488,32 @@ impl AvpAuthorizationService {
         
         context_pairs
     }
+
+    fn redact_auth_headers(request: &CheckRequest) -> CheckRequest {
+        let mut redacted_request = request.clone();
+        
+        // Check if we have http attributes with headers
+        if let Some(attributes) = &mut redacted_request.attributes {
+            if let Some(request_info) = &mut attributes.request {
+                if let Some(http) = &mut request_info.http {
+                    // Redact authorization header if present
+                    for (key, value) in &mut http.headers {
+                        if key.to_lowercase() == "authorization" {
+                            if value.starts_with("Bearer ") {
+                                // Keep first 15 chars of the token
+                                let token_start = value.chars().take(15 + 7).collect::<String>();
+                                *value = format!("{}...<redacted>", token_start);
+                            } else {
+                                *value = "<redacted>".to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        redacted_request
+    }
 }
 
 #[tonic::async_trait]
@@ -466,8 +524,9 @@ impl Authorization for AvpAuthorizationService {
     ) -> Result<Response<CheckResponse>, Status> {
         // Extract the request and decode the attributes (keep this part)
         let check_request = request.into_inner();
+        
         // debug!("Received authorization request");
-        debug!("Received full check request: {:?}", check_request);
+        trace!("Received full check request: {:?}", AvpAuthorizationService::redact_auth_headers(&check_request));
         
         // Get request attributes
         let attributes = match check_request.attributes.as_ref() {
@@ -480,14 +539,14 @@ impl Authorization for AvpAuthorizationService {
             }
         };
         
-        debug!("Attributes: {:?}", attributes);
-        debug!("Request field: {:?}", attributes.request);
+        // debug!("Attributes: {:?}", attributes);
+        // debug!("Request field: {:?}", attributes.request);
 
         // Get HTTP request details
         let http = match attributes.request.as_ref().and_then(|r| {
-            debug!("Request object: {:?}", r);
+            // debug!("Request object: {:?}", r);
             let http_ref = r.http.as_ref();
-            debug!("HTTP field: {:?}", http_ref); 
+            // debug!("HTTP field: {:?}", http_ref); 
             http_ref
         }) {
             Some(http) => http,
@@ -506,7 +565,7 @@ impl Authorization for AvpAuthorizationService {
         trace!("Authorization request received: method={}, path={}", method, path);
         
         // Start timing the request
-        let _request_timer = Telemetry::time_request(&method, &path);
+        let _request_timer = Telemetry::time_check_request(&method, &path);
         
         // Parse query parameters
         let query_params = parse_query_params(&path);

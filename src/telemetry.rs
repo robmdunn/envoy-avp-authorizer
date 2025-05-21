@@ -3,14 +3,13 @@ use tracing::info;
 use std::time::Instant;
 
 // Define metric names
-const METRIC_AVP_REQUESTS_TOTAL: &str = "avp_requests_total";
-const METRIC_AVP_REQUEST_DURATION_SECONDS: &str = "avp_request_duration_seconds";
+const METRIC_CHECK_REQUESTS_TOTAL: &str = "check_requests_total";
+const METRIC_CHECK_REQUEST_DURATION_SECONDS: &str = "check_request_duration_seconds";
 const METRIC_JWT_VALIDATION_TOTAL: &str = "jwt_validation_total";
 const METRIC_JWT_VALIDATION_FAILURES: &str = "jwt_validation_failures";
-const METRIC_ENTITY_FETCH_DURATION_SECONDS: &str = "entity_fetch_duration_seconds";
 const METRIC_CACHE_HITS: &str = "avp_cache_hits_total";
 const METRIC_CACHE_MISSES: &str = "avp_cache_misses_total";
-const METRIC_CEDAR_EVALUATION_DURATION_SECONDS: &str = "cedar_evaluation_duration_seconds";
+const METRIC_AVP_REQUEST_DURATION_SECONDS: &str = "evaluation_duration_seconds";
 const METRIC_JWKS_REFRESH_TOTAL: &str = "jwks_refresh_total";
 const METRIC_JWKS_REFRESH_FAILURES: &str = "jwks_refresh_failures";
 
@@ -34,7 +33,7 @@ impl Telemetry {
     // Record an authorization request
     pub fn record_request(method: &str, path: &str, status: &str) {
         counter!(
-            METRIC_AVP_REQUESTS_TOTAL,
+            METRIC_CHECK_REQUESTS_TOTAL,
             "method" => method.to_string(),
             "path" => path.to_string(),
             "status" => status.to_string()
@@ -42,7 +41,7 @@ impl Telemetry {
     }
 
     // Start timing a request and return a guard that will record the duration when dropped
-    pub fn time_request(method: &str, path: &str) -> RequestTimer {
+    pub fn time_check_request(method: &str, path: &str) -> RequestTimer {
         RequestTimer {
             start: Instant::now(),
             method: method.to_string(),
@@ -75,8 +74,8 @@ impl Telemetry {
     }
 
     // Time Cedar policy evaluation
-    pub fn time_cedar_evaluation() -> CedarEvaluationTimer {
-        CedarEvaluationTimer {
+    pub fn time_avp_request() -> AvpRequestTimer {
+        AvpRequestTimer {
             start: Instant::now(),
         }
     }
@@ -108,38 +107,22 @@ impl Drop for RequestTimer {
     fn drop(&mut self) {
         let duration = self.start.elapsed();
         histogram!(
-            METRIC_AVP_REQUEST_DURATION_SECONDS,
+            METRIC_CHECK_REQUEST_DURATION_SECONDS,
             "method" => self.method.clone(),
             "path" => self.path.clone()
         ).record(duration.as_secs_f64());
     }
 }
 
-// Timer guard for entity fetch duration
-pub struct EntityFetchTimer {
-    start: Instant,
-    entity_type: String,
-}
-
-impl Drop for EntityFetchTimer {
-    fn drop(&mut self) {
-        let duration = self.start.elapsed();
-        histogram!(
-            METRIC_ENTITY_FETCH_DURATION_SECONDS,
-            "entity_type" => self.entity_type.clone()
-        ).record(duration.as_secs_f64());
-    }
-}
-
 // Timer guard for Cedar policy evaluation
-pub struct CedarEvaluationTimer {
+pub struct AvpRequestTimer {
     start: Instant,
 }
 
-impl Drop for CedarEvaluationTimer {
+impl Drop for AvpRequestTimer {
     fn drop(&mut self) {
         let duration = self.start.elapsed();
-        histogram!(METRIC_CEDAR_EVALUATION_DURATION_SECONDS)
+        histogram!(METRIC_AVP_REQUEST_DURATION_SECONDS)
             .record(duration.as_secs_f64());
     }
 }

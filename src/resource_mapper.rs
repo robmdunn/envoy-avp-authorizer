@@ -72,7 +72,7 @@ impl ResourcePath {
                 self.resource_type.clone()
             }
         };
-        debug!("Converted ResourcePath to entity_uid: '{}'", result);
+        trace!("Converted ResourcePath to entity_uid: '{}'", result);
         result
     }
 }
@@ -244,12 +244,12 @@ impl ResourceMapper {
     // Parse a path into resource information
     pub fn parse_path(&self, path: &str) -> Result<ResourcePath, ResourceMappingError> {
         // Add debug logging about the original path
-        debug!("Attempting to parse path: '{}'", path);
+        trace!("Attempting to parse path: '{}'", path);
         
         // Remove API prefix if present using regex
         let clean_path = if let Some(captures) = self.api_prefix_regex.captures(path) {
             let matched_prefix = captures.get(0).map_or("", |m| m.as_str());
-            debug!("Found API prefix: '{}' in path", matched_prefix);
+            trace!("Found API prefix: '{}' in path", matched_prefix);
             path.strip_prefix(matched_prefix).unwrap_or(path)
         } else {
             path.trim_start_matches('/')
@@ -257,24 +257,24 @@ impl ResourceMapper {
         
         // Log if we modified the path
         if clean_path != path {
-            debug!("Trimmed API prefix: '{}' -> '{}'", path, clean_path);
+            trace!("Trimmed API prefix: '{}' -> '{}'", path, clean_path);
         }
         
         // Try to match the path against our patterns
         let matches = self.pattern_set.matches(clean_path);
         
         if !matches.matched_any() {
-            debug!("No pattern matched path: '{}' (cleaned: '{}')", path, clean_path);
-            debug!("Available patterns: {:?}", self.get_patterns_info());
+            trace!("No pattern matched path: '{}' (cleaned: '{}')", path, clean_path);
+            trace!("Available patterns: {:?}", self.get_patterns_info());
             
             // Fall back to the default path parsing
-            debug!("Falling back to default path parsing");
+            trace!("Falling back to default path parsing");
             return self.default_parse_path(clean_path);
         }
         
         // Find all matches for debugging
         let match_indices: Vec<_> = matches.iter().collect();
-        debug!("Patterns matched for '{}': {:?} (using first match)", 
+        trace!("Patterns matched for '{}': {:?} (using first match)", 
             clean_path, 
             match_indices.iter()
                 .map(|&i| format!("{} ({})", i, self.patterns[i].pattern))
@@ -284,7 +284,7 @@ impl ResourceMapper {
         let pattern_index = match_indices[0];
         let pattern = &self.patterns[pattern_index];
         
-        debug!("Path '{}' matched pattern '{}'", clean_path, pattern.pattern);
+        trace!("Path '{}' matched pattern '{}'", clean_path, pattern.pattern);
         
         // Get the regex captures
         let captures = pattern.regex.captures(clean_path)
@@ -300,7 +300,7 @@ impl ResourceMapper {
                 captures.name(capture_name)
                     .map(|m| m.as_str().to_string())
                     .unwrap_or_else(|| {
-                        debug!("Capture group '{}' not found, using empty string", capture_name);
+                        trace!("Capture group '{}' not found, using empty string", capture_name);
                         String::new()
                     })
             }
@@ -315,7 +315,7 @@ impl ResourceMapper {
         } else {
             pattern.resource_id_group.as_ref().and_then(|group| {
                 let id = captures.name(group).map(|m| m.as_str().to_string());
-                debug!("Extracted resource_id: {:?} from group: {:?}", id, group);
+                trace!("Extracted resource_id: {:?} from group: {:?}", id, group);
                 id
             })
         };
@@ -334,7 +334,7 @@ impl ResourceMapper {
         // Extract parent ID if present in the pattern
         let parent_id = pattern.parent_id_group.as_ref().and_then(|group| {
             let id = captures.name(group).map(|m| m.as_str().to_string());
-            debug!("Extracted parent_id: {:?} from group: {:?}", id, group);
+            trace!("Extracted parent_id: {:?} from group: {:?}", id, group);
             id
         });
         
@@ -346,7 +346,7 @@ impl ResourceMapper {
                 trace!("Extracted parameter: {}={} from group: {}", param_name, value, group_name);
                 parameters.insert(param_name.clone(), value);
             } else {
-                debug!("Failed to extract parameter: {} from group: {}", param_name, group_name);
+                trace!("Failed to extract parameter: {} from group: {}", param_name, group_name);
             }
         }
         
@@ -416,30 +416,30 @@ impl ResourceMapper {
     
     // Map HTTP method to Cedar action based on resource info and custom mappings
     pub fn map_method_to_action(&self, method: &str, path: &str, _resource_info: &ResourcePath) -> String {
-        debug!("Mapping method '{}' to action for path '{}'", method, path);
+        trace!("Mapping method '{}' to action for path '{}'", method, path);
         
         // Clean up the path by removing the API prefix if present
         let clean_path = if let Some(captures) = self.api_prefix_regex.captures(path) {
             let matched_prefix = captures.get(0).map_or("", |m| m.as_str());
-            debug!("Removing API prefix: '{}' from path for action mapping", matched_prefix);
+            trace!("Removing API prefix: '{}' from path for action mapping", matched_prefix);
             path.strip_prefix(matched_prefix).unwrap_or(path)
         } else {
             path.trim_start_matches('/')
         };
         
-        debug!("Using clean path for action mapping: '{}'", clean_path);
+        trace!("Using clean path for action mapping: '{}'", clean_path);
         
         // Check if we have a custom action mapping for this path
         for (pattern, action_map) in &self.custom_action_maps {
             if pattern.is_match(clean_path) {
-                debug!("Path '{}' matched custom action pattern", clean_path);
+                trace!("Path '{}' matched custom action pattern", clean_path);
                 if let Some(action) = action_map.get(&method.to_uppercase()) {
-                    debug!("Mapped method '{}' to custom action '{}'", method, action);
+                    trace!("Mapped method '{}' to custom action '{}'", method, action);
                     if action.contains("::") {
-                        debug!("Using namespaced action as is: {}", action);
+                        trace!("Using namespaced action as is: {}", action);
                         return action.clone();
                     } else {
-                        debug!("Adding Action:: prefix to: {}", action);
+                        trace!("Adding Action:: prefix to: {}", action);
                         return format!("Action::\"{}\"", action);
                     }
                 }
@@ -451,13 +451,13 @@ impl ResourceMapper {
             .get(&method.to_uppercase().to_string())
             .cloned()
             .unwrap_or_else(|| {
-                debug!("No mapping found for method '{}', using default 'access'", method);
+                trace!("No mapping found for method '{}', using default 'access'", method);
                 "access".to_string()
             });
             
         let action = &base_action;
         
-        debug!("Final mapped action: '{}' for method '{}' on path '{}'", action, method, path);
+        trace!("Final mapped action: '{}' for method '{}' on path '{}'", action, method, path);
         format!("Action::\"{}\"", action)
     }
 }

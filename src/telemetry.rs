@@ -3,7 +3,7 @@ use tracing::info;
 use std::time::Instant;
 
 // Define metric names
-const METRIC_CHECK_REQUESTS_TOTAL: &str = "check_requests_total";
+const METRIC_AVP_REQUESTS_TOTAL: &str = "avp_requests_total";
 const METRIC_CHECK_REQUEST_DURATION_SECONDS: &str = "check_request_duration_seconds";
 const METRIC_JWT_VALIDATION_TOTAL: &str = "jwt_validation_total";
 const METRIC_JWT_VALIDATION_FAILURES: &str = "jwt_validation_failures";
@@ -33,7 +33,7 @@ impl Telemetry {
     // Record an authorization request
     pub fn record_request(method: &str, path: &str, status: &str) {
         counter!(
-            METRIC_CHECK_REQUESTS_TOTAL,
+            METRIC_AVP_REQUESTS_TOTAL,
             "method" => method.to_string(),
             "path" => path.to_string(),
             "status" => status.to_string()

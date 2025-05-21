@@ -237,7 +237,9 @@ impl AvpAuthorizationService {
         
         // Compute cache key for potential caching
         let stable_context = AvpAuthorizationService::create_stable_context_representation(&context_pairs);
-        trace!("Context pairs for request: {:#?}", stable_context);
+
+        let redacted_context = AvpAuthorizationService::redact_sensitive_context(&context_pairs);
+        trace!("Context pairs for request: {:#?}", redacted_context);
 
         let context_hash = AuthorizationCache::compute_context_hash(&stable_context);
         debug!("Context hash for request: {} ({} context pairs)", context_hash, context_pairs.len());
@@ -514,6 +516,36 @@ impl AvpAuthorizationService {
         
         redacted_request
     }
+
+    fn redact_sensitive_context(context: &HashMap<String, serde_json::Value>) -> String {
+        // Create a copy of the context for redaction
+        let mut redacted_context = context.clone();
+        
+        // List of sensitive fields to redact
+        let sensitive_keys = [
+            "header_authorization"
+        ];
+        
+        // Redact sensitive fields
+        for key in sensitive_keys.iter() {
+            if let Some(serde_json::Value::String(val_str)) = redacted_context.get_mut(*key) {
+                if key == &"header_authorization" && val_str.starts_with("Bearer ") {
+                    // Show just a bit of the token
+                    let token_start = val_str.chars().take(15 + 7).collect::<String>();
+                    *val_str = format!("{}...<redacted>", token_start);
+                } else {
+                    // For other sensitive fields, show just the beginning
+                    if val_str.len() > 5 {
+                        let prefix = val_str.chars().take(5).collect::<String>();
+                        *val_str = format!("{}...<redacted>", prefix);
+                    }
+                }
+            }
+        }
+        
+        // Create the stable string representation with redacted values
+        AvpAuthorizationService::create_stable_context_representation(&redacted_context)
+    }
 }
 
 #[tonic::async_trait]
@@ -539,14 +571,9 @@ impl Authorization for AvpAuthorizationService {
             }
         };
         
-        // debug!("Attributes: {:?}", attributes);
-        // debug!("Request field: {:?}", attributes.request);
-
         // Get HTTP request details
         let http = match attributes.request.as_ref().and_then(|r| {
-            // debug!("Request object: {:?}", r);
             let http_ref = r.http.as_ref();
-            // debug!("HTTP field: {:?}", http_ref); 
             http_ref
         }) {
             Some(http) => http,

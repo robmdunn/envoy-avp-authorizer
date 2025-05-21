@@ -480,8 +480,13 @@ impl ResourceMapper {
                 debug!("Path '{}' matched custom action pattern", clean_path);
                 if let Some(action) = action_map.get(&method.to_uppercase()) {
                     debug!("Mapped method '{}' to custom action '{}'", method, action);
-                    // Return the full action string directly from the mapping
-                    return action.clone();
+                    if action.contains("::") {
+                        debug!("Using namespaced action as is: {}", action);
+                        return action.clone();
+                    } else {
+                        debug!("Adding Action:: prefix to: {}", action);
+                        return format!("Action::\"{}\"", action);
+                    }
                 }
             }
         }

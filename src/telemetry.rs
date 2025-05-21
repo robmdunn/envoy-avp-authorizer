@@ -9,7 +9,7 @@ const METRIC_JWT_VALIDATION_TOTAL: &str = "jwt_validation_total";
 const METRIC_JWT_VALIDATION_FAILURES: &str = "jwt_validation_failures";
 const METRIC_CACHE_HITS: &str = "avp_cache_hits_total";
 const METRIC_CACHE_MISSES: &str = "avp_cache_misses_total";
-const METRIC_AVP_REQUEST_DURATION_SECONDS: &str = "evaluation_duration_seconds";
+const METRIC_AVP_REQUEST_DURATION_SECONDS: &str = "avp_request_duration_seconds";
 const METRIC_JWKS_REFRESH_TOTAL: &str = "jwks_refresh_total";
 const METRIC_JWKS_REFRESH_FAILURES: &str = "jwks_refresh_failures";
 

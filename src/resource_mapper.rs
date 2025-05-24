@@ -2,38 +2,6 @@ use std::collections::HashMap;
 use tracing::{debug, info, trace, warn};
 use regex::{Regex, RegexSet};
 use thiserror::Error;
-use std::str::FromStr;
-use std::fmt;
-
-// Helper enum to identify explicit capture group references
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FieldValue {
-    Literal(String),
-    CaptureGroup(String),
-}
-
-impl FromStr for FieldValue {
-    type Err = ResourceMappingError;
-    
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Check if the value is a capture group reference (surrounded by curly braces)
-        if s.starts_with("{") && s.ends_with("}") {
-            let capture_name = &s[1..s.len()-1];
-            Ok(FieldValue::CaptureGroup(capture_name.to_string()))
-        } else {
-            Ok(FieldValue::Literal(s.to_string()))
-        }
-    }
-}
-
-impl fmt::Display for FieldValue {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FieldValue::Literal(s) => write!(f, "{}", s),
-            FieldValue::CaptureGroup(s) => write!(f, "{{{}}}", s),
-        }
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum ResourceMappingError {
@@ -59,27 +27,12 @@ pub struct Parent {
     pub parent_id: String,
 }
 
-impl ResourcePath {
-    pub fn to_entity_uid(&self) -> String {
-        let result = match &self.resource_id {
-            Some(id) => {
-                format!("{}::{}", self.resource_type, id)
-            },
-            None => {
-                self.resource_type.clone()
-            }
-        };
-        trace!("Converted ResourcePath to entity_uid: '{}'", result);
-        result
-    }
-}
-
 // A resource pattern for mapping paths to resources
 #[derive(Debug, Clone)]
 struct ResourcePattern {
     pattern: String,
     regex: Regex,
-    resource_type: FieldValue,
+    resource_type: String,  // ← Simplified
     resource_id: Option<String>,
     parents: Vec<(String, String)>,
     parameter_groups: HashMap<String, String>,
@@ -163,7 +116,7 @@ impl ResourceMapper {
             .collect();
         
         // Parse resource_type as FieldValue
-        let resource_type_value = FieldValue::from_str(resource_type)?;
+        let resource_type_value = resource_type.to_string();
             
         // Convert parents vector to owned strings
         let parents_owned: Vec<(String, String)> = parents.into_iter().collect();
@@ -293,20 +246,8 @@ impl ResourceMapper {
         }
 
         // Extract resource type with substitution
-        let resource_type = match &pattern.resource_type {
-            FieldValue::Literal(literal_value) => {
-                substitute_variables(literal_value, &capture_map)
-                    .unwrap_or_else(|_| literal_value.clone())
-            },
-            FieldValue::CaptureGroup(capture_name) => {
-                capture_map.get(capture_name)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        trace!("Capture group '{}' not found, using empty string", capture_name);
-                        String::new()
-                    })
-            }
-        };
+        let resource_type = substitute_variables(&pattern.resource_type, &capture_map)
+            .unwrap_or_else(|_| pattern.resource_type.clone());
 
         // Extract resource ID with substitution
         let resource_id = pattern.resource_id.as_ref().and_then(|template| {

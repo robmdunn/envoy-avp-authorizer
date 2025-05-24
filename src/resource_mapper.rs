@@ -289,12 +289,29 @@ impl ResourceMapper {
             }
         }
         
-        Ok(ResourcePath {
+        let resource_path = ResourcePath {
             resource_type,
             resource_id,
             parents,
             parameters,
-        })
+        };
+
+        // Consistent resource logging
+        let resource_display = match &resource_path.resource_id {
+            Some(id) => format!("{}::{}", resource_path.resource_type, id),
+            None => resource_path.resource_type.clone(),
+        };
+        trace!("Parsed resource: {}", resource_display);
+
+        if !resource_path.parents.is_empty() {
+            for (i, parent) in resource_path.parents.iter().enumerate() {
+                trace!("  parent[{}]: {}::{}", i, parent.parent_type, parent.parent_id);
+            }
+        }
+
+        trace!("Resource parameters: {:?}", resource_path.parameters);
+
+        Ok(resource_path)
     }
     
     // Default path parsing logic for backward compatibility
@@ -396,9 +413,12 @@ impl ResourceMapper {
             });
             
         let action = &base_action;
-        
-        trace!("Final mapped action: '{}' for method '{}' on path '{}'", action, method, path);
-        format!("Action::\"{}\"", action)
+        let formatted_action = format!("Action::\"{}\"", action);
+
+        debug!("Mapped action: {} (method={}, path={})", formatted_action, method, clean_path);
+        trace!("Action mapping details: method='{}' -> base_action='{}' -> formatted='{}'", method, action, formatted_action);
+
+        formatted_action
     }
 }
 

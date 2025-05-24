@@ -148,28 +148,28 @@ struct ActionMapping {
 fn parse_action_string(action: &str) -> (String, String) {
     trace!("Parsing action string: '{}'", action);
     
-    // Handle legacy format: Action::"actionId"
-    if action.starts_with("Action::\"") && action.ends_with("\"") {
+    let result = if action.starts_with("Action::\"") && action.ends_with("\"") {
         let action_id = action.trim_start_matches("Action::\"").trim_end_matches("\"");
         trace!("Parsed legacy action format: action_type='Action', action_id='{}'", action_id);
-        return ("Action".to_string(), action_id.to_string());
-    }
-    
-    // Handle namespaced format: Namespace::ActionType::ActionId
-    if let Some(last_separator) = action.rfind("::") {
+        ("Action".to_string(), action_id.to_string())
+    } else if let Some(last_separator) = action.rfind("::") {
         let action_type = &action[..last_separator];
         let action_id = &action[last_separator + 2..];
         
-        // Don't treat empty parts as valid
         if !action_type.is_empty() && !action_id.is_empty() {
             trace!("Parsed namespaced action: action_type='{}', action_id='{}'", action_type, action_id);
-            return (action_type.to_string(), action_id.to_string());
+            (action_type.to_string(), action_id.to_string())
+        } else {
+            trace!("Using fallback parsing: action_type='Action', action_id='{}'", action);
+            ("Action".to_string(), action.to_string())
         }
-    }
+    } else {
+        trace!("Using fallback parsing: action_type='Action', action_id='{}'", action);
+        ("Action".to_string(), action.to_string())
+    };
     
-    // Fallback: treat the entire string as action_id with default Action type
-    trace!("Using fallback parsing: action_type='Action', action_id='{}'", action);
-    ("Action".to_string(), action.to_string())
+    debug!("Parsed action: {}::{}", result.0, result.1);
+    result
 }
 
 // Our authorization service implementation
@@ -297,15 +297,20 @@ impl AvpAuthorizationService {
             
             // Return the cached decision
             if cached_decision == CacheDecision::Allow {
-                info!("Authorization allowed (cached): principal={}, action={}, resource={}", 
-                    principal, action, resource_entity_id);
+                info!("AUTHORIZATION ALLOWED: principal={}, action={}::{}, resource={}::{}, path={}", 
+                    principal, action_type, action_id, resource_entity_type, resource_entity_id, path);
+                debug!("  context_hash={}, cached=true", context_hash);
                 
                 Ok(Response::new(CheckResponse::with_status(
                     Status::ok("Request authorized"),
                 )))
             } else {
-                warn!("Authorization denied (cached): principal={}, action={}, resource={}", 
-                    principal, action, resource_entity_id);
+                warn!("AUTHORIZATION DENIED: principal={}, action={}::{}, resource={}::{}, path={}", 
+                    principal, action_type, action_id, resource_entity_type, resource_entity_id, path);
+                debug!("  context_hash={}, cached=true", context_hash);
+                if let Some(ref diag) = diagnostics {
+                    debug!("  diagnostics: {}", diag);
+                }
                 
                 // Include diagnostics if available
                 let message = if let Some(diag) = diagnostics {
@@ -341,7 +346,7 @@ impl AvpAuthorizationService {
                     })?)
                 .resource(aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
                     .entity_id(resource_entity_id.clone())
-                    .entity_type(resource_entity_type)
+                    .entity_type(resource_entity_type.clone())
                     .build()
                     .map_err(|e| {
                         error!("Failed to build entity identifier: {}", e);
@@ -397,9 +402,12 @@ impl AvpAuthorizationService {
             ).await;
             
             // Return the appropriate response
-            if *auth_result.decision() == Decision::Allow {
-                info!("Authorization allowed: principal={}, action={}, resource={}", 
-                    principal, action, resource_entity_id);
+            let decision_result = *auth_result.decision() == Decision::Allow;
+
+            if decision_result {
+                info!("AUTHORIZATION ALLOWED: principal={}, action={}::{}, resource={}::{}, path={}", 
+                    principal, action_type, action_id, resource_entity_type, resource_entity_id, path);
+                debug!("  context_hash={}, cached=false", context_hash);
                 
                 // Record the metric
                 Telemetry::record_request(method, path, "allowed");
@@ -408,8 +416,12 @@ impl AvpAuthorizationService {
                     Status::ok("Request authorized"),
                 )))
             } else {
-                warn!("Authorization denied: principal={}, action={}, resource={}", 
-                    principal, action, resource_entity_id);
+                warn!("AUTHORIZATION DENIED: principal={}, action={}::{}, resource={}::{}, path={}", 
+                    principal, action_type, action_id, resource_entity_type, resource_entity_id, path);
+                debug!("  context_hash={}, cached=false", context_hash);
+                if let Some(ref diag) = diagnostics {
+                    debug!("  diagnostics: {}", diag);
+                }
                 
                 // Record the metric
                 Telemetry::record_request(method, path, "denied");
@@ -597,11 +609,9 @@ impl AvpAuthorizationService {
 
         // Add parent entities
         for parent in &resource_info.parents {
-            let parent_entity_id = format!("{}::{}", parent.parent_type, parent.parent_id);
-            
             let parent_identifier = aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
                 .entity_type(&parent.parent_type)
-                .entity_id(&parent_entity_id)
+                .entity_id(&parent.parent_id)
                 .build()
                 .map_err(|e| {
                     error!("Failed to build parent entity identifier: {}", e);
@@ -613,17 +623,16 @@ impl AvpAuthorizationService {
                 .build();
 
             entity_items.push(entity_item);
-            debug!("Added parent entity: {}::{}", parent.parent_type, parent_entity_id);
+            debug!("Added parent entity: {}::{}", parent.parent_type, parent.parent_id);
         }
 
         // Add the resource entity itself with parent relationships
         if !entity_items.is_empty() {
             let mut resource_parents = Vec::new();
             for parent in &resource_info.parents {
-                let parent_entity_id = format!("{}::{}", parent.parent_type, parent.parent_id);
                 let parent_identifier = aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
                     .entity_type(&parent.parent_type)
-                    .entity_id(&parent_entity_id)
+                    .entity_id(&parent.parent_id)
                     .build()
                     .map_err(|e| {
                         error!("Failed to build parent identifier for resource: {}", e);
@@ -650,9 +659,26 @@ impl AvpAuthorizationService {
             debug!("Added resource entity with {} parents: {}", resource_info.parents.len(), resource_entity_id);
         }
 
-        let entities_def = aws_sdk_verifiedpermissions::types::EntitiesDefinition::EntityList(entity_items);
+        if tracing::enabled!(tracing::Level::TRACE) {
+            // Debug log the full entity structure
+            trace!("Built entities definition with {} entities", entity_items.len());
+            for (i, item) in entity_items.iter().enumerate() {
+                if let Some(identifier) = item.identifier() {
+                    trace!("  entity[{}]: {}::{}", i, identifier.entity_type(), identifier.entity_id());
+                } else {
+                    trace!("  entity[{}]: <no identifier>", i);
+                }
+                
+                let parents = item.parents();
+                if !parents.is_empty() {
+                    for (j, parent) in parents.iter().enumerate() {
+                        trace!("    parent[{}]: {}::{}", j, parent.entity_type(), parent.entity_id());
+                    }
+                }
+            }
+        }
 
-        debug!("Built entities definition with {} entities", entities_def.as_entity_list().map(|e| e.len()).unwrap_or(0));
+        let entities_def = aws_sdk_verifiedpermissions::types::EntitiesDefinition::EntityList(entity_items);
         Ok(Some(entities_def))
     }
 }

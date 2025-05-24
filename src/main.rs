@@ -126,9 +126,9 @@ struct ResourceMappingConfig {
 #[derive(Debug, Deserialize)]
 struct ResourceMappingPattern {
     pattern: String,
-    resource_type: String,  // Now can contain capture group references like "{resource}"
+    resource_type: String,
     resource_id_group: Option<String>,
-    parent_type: Option<String>,  // Now can contain capture group references like "{parent}"
+    parent_type: Option<String>,
     parent_id_group: Option<String>,
     parameter_groups: HashMap<String, String>,
 }
@@ -137,6 +137,34 @@ struct ResourceMappingPattern {
 struct ActionMapping {
     path_pattern: String,
     mappings: HashMap<String, String>,
+}
+
+// Helper function to parse action strings into (action_type, action_id)
+fn parse_action_string(action: &str) -> (String, String) {
+    trace!("Parsing action string: '{}'", action);
+    
+    // Handle legacy format: Action::"actionId"
+    if action.starts_with("Action::\"") && action.ends_with("\"") {
+        let action_id = action.trim_start_matches("Action::\"").trim_end_matches("\"");
+        trace!("Parsed legacy action format: action_type='Action', action_id='{}'", action_id);
+        return ("Action".to_string(), action_id.to_string());
+    }
+    
+    // Handle namespaced format: Namespace::ActionType::ActionId
+    if let Some(last_separator) = action.rfind("::") {
+        let action_type = &action[..last_separator];
+        let action_id = &action[last_separator + 2..];
+        
+        // Don't treat empty parts as valid
+        if !action_type.is_empty() && !action_id.is_empty() {
+            trace!("Parsed namespaced action: action_type='{}', action_id='{}'", action_type, action_id);
+            return (action_type.to_string(), action_id.to_string());
+        }
+    }
+    
+    // Fallback: treat the entire string as action_id with default Action type
+    trace!("Using fallback parsing: action_type='Action', action_id='{}'", action);
+    ("Action".to_string(), action.to_string())
 }
 
 // Our authorization service implementation
@@ -211,10 +239,10 @@ impl AvpAuthorizationService {
     ) -> Result<Response<CheckResponse>, Status> {
         trace!("Using AVP API for authorization check: path='{}', method='{}'", path, method);
         
-        // Extract the action ID (e.g., "read" from "Action::\"read\"")
-        let action_id = action.trim_start_matches("Action::\"").trim_end_matches("\"");
-        trace!("Extracted action_id: '{}' from action: '{}'", action_id, action);
-        
+        // Parse the action string to extract action_type and action_id
+        let (action_type, action_id) = parse_action_string(&action);
+        trace!("Parsed action: type='{}', id='{}' from full action: '{}'", action_type, action_id, action);
+
         // Get the resource entity ID from resource info
         let resource_entity_id = resource_info.to_entity_uid();
         let resource_entity_type = resource_info.resource_type.clone();
@@ -245,12 +273,12 @@ impl AvpAuthorizationService {
         debug!("Context hash for request: {} ({} context pairs)", context_hash, context_pairs.len());
 
         let principal_id = claims.sub.clone();
-        let principal = format!("User::\"{principal_id}\"");
-        
+        let principal = format!("User::{}", principal_id);
+
         // Create EntityUid objects using our custom type
         let principal_entity = EntityUid::new(principal.clone());
         let action_entity = EntityUid::new(action.clone());
-        let resource_entity = EntityUid::new(format!("Resource::\"{}\"", resource_entity_id.clone()));
+        let resource_entity = EntityUid::new(resource_entity_id.clone());
                 
         // Try to get result from cache first
         if let Some((cached_decision, diagnostics)) = self.auth_cache.get(
@@ -295,15 +323,15 @@ impl AvpAuthorizationService {
                 .policy_store_id(&self.policy_store_id)
                 .identity_token(token)
                 .action(aws_sdk_verifiedpermissions::types::ActionIdentifier::builder()
-                    .action_id(action_id)
-                    .action_type("Action")
+                    .action_id(&action_id)
+                    .action_type(&action_type)
                     .build()
                     .map_err(|e| {
                         error!("Failed to build action identifier: {}", e);
                         Status::internal("Failed to build action identifier")
                     })?)
                 .resource(aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
-                    .entity_id(resource_entity_id.clone()) // Clone here
+                    .entity_id(resource_entity_id.clone())
                     .entity_type(resource_entity_type)
                     .build()
                     .map_err(|e| {

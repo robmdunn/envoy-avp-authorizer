@@ -127,10 +127,15 @@ struct ResourceMappingConfig {
 struct ResourceMappingPattern {
     pattern: String,
     resource_type: String,
-    resource_id_group: Option<String>,
-    parent_type: Option<String>,
-    parent_id_group: Option<String>,
+    resource_id: Option<String>,
+    parents: Option<Vec<ParentMapping>>,
     parameter_groups: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ParentMapping {
+    parent_type: String,
+    parent_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,7 +249,8 @@ impl AvpAuthorizationService {
         trace!("Parsed action: type='{}', id='{}' from full action: '{}'", action_type, action_id, action);
 
         // Get the resource entity ID from resource info
-        let resource_entity_id = resource_info.to_entity_uid();
+        let resource_entity_id = resource_info.resource_id.clone()
+            .unwrap_or_else(|| resource_info.resource_type.clone());
         let resource_entity_type = resource_info.resource_type.clone();
         debug!("Using resource_entity_id: '{}', resource_entity_type: '{}'", 
             resource_entity_id, resource_entity_type);
@@ -315,10 +321,13 @@ impl AvpAuthorizationService {
         } else {
             Telemetry::record_cache_miss();
 
+            // Build entities definition for parent hierarchies
+            let entities = self.build_entities_definition(resource_info, &resource_entity_id, &resource_entity_type)?;
+
             // Call AVP's IsAuthorizedWithToken API
             let eval_timer = Telemetry::time_avp_request();
 
-            let auth_result = self.avp_client
+            let mut request_builder = self.avp_client
                 .is_authorized_with_token()
                 .policy_store_id(&self.policy_store_id)
                 .identity_token(token)
@@ -338,7 +347,14 @@ impl AvpAuthorizationService {
                         error!("Failed to build entity identifier: {}", e);
                         Status::internal("Failed to build entity identifier")
                     })?)
-                .context(avp_context)
+                .context(avp_context);
+
+            // Add entities if we have any
+            if let Some(entities_def) = entities {
+                request_builder = request_builder.entities(entities_def);
+            }
+
+            let auth_result = request_builder
                 .send()
                 .await
                 .map_err(|e| {
@@ -478,33 +494,23 @@ impl AvpAuthorizationService {
             "resource_type".to_string(), 
             serde_json::Value::String(resource_info.resource_type.clone())
         );
-        
+
         if let Some(ref id) = resource_info.resource_id {
             context_pairs.insert(
                 "resource_id".to_string(), 
                 serde_json::Value::String(id.clone())
             );
         }
-        
-        if let Some(ref parent_type) = resource_info.parent_type {
+
+        // Add parent information from the parents array
+        for (i, parent) in resource_info.parents.iter().enumerate() {
             context_pairs.insert(
-                "parent_type".to_string(), 
-                serde_json::Value::String(parent_type.clone())
+                format!("parent_{}_type", i), 
+                serde_json::Value::String(parent.parent_type.clone())
             );
-        }
-        
-        if let Some(ref parent_id) = resource_info.parent_id {
             context_pairs.insert(
-                "parent_id".to_string(), 
-                serde_json::Value::String(parent_id.clone())
-            );
-        }
-        
-        // Add resource parameters
-        for (k, v) in &resource_info.parameters {
-            context_pairs.insert(
-                format!("param_{}", k), 
-                serde_json::Value::String(v.clone())
+                format!("parent_{}_id", i), 
+                serde_json::Value::String(parent.parent_id.clone())
             );
         }
         
@@ -573,6 +579,81 @@ impl AvpAuthorizationService {
         
         // Create the stable string representation with redacted values
         AvpAuthorizationService::create_stable_context_representation(&redacted_context)
+    }
+
+    // Build entities definition for AVP from resource hierarchy
+    fn build_entities_definition(
+        &self,
+        resource_info: &ResourcePath,
+        resource_entity_id: &str,
+        resource_entity_type: &str,
+    ) -> Result<Option<aws_sdk_verifiedpermissions::types::EntitiesDefinition>, Status> {
+        if resource_info.parents.is_empty() {
+            trace!("No parent entities to include");
+            return Ok(None);
+        }
+
+        let mut entity_items = Vec::new();
+
+        // Add parent entities
+        for parent in &resource_info.parents {
+            let parent_entity_id = format!("{}::{}", parent.parent_type, parent.parent_id);
+            
+            let parent_identifier = aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
+                .entity_type(&parent.parent_type)
+                .entity_id(&parent_entity_id)
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build parent entity identifier: {}", e);
+                    Status::internal("Failed to build parent entity identifier")
+                })?;
+
+            let entity_item = aws_sdk_verifiedpermissions::types::EntityItem::builder()
+                .identifier(parent_identifier)
+                .build();
+
+            entity_items.push(entity_item);
+            debug!("Added parent entity: {}::{}", parent.parent_type, parent_entity_id);
+        }
+
+        // Add the resource entity itself with parent relationships
+        if !entity_items.is_empty() {
+            let mut resource_parents = Vec::new();
+            for parent in &resource_info.parents {
+                let parent_entity_id = format!("{}::{}", parent.parent_type, parent.parent_id);
+                let parent_identifier = aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
+                    .entity_type(&parent.parent_type)
+                    .entity_id(&parent_entity_id)
+                    .build()
+                    .map_err(|e| {
+                        error!("Failed to build parent identifier for resource: {}", e);
+                        Status::internal("Failed to build parent identifier")
+                    })?;
+                resource_parents.push(parent_identifier);
+            }
+
+            let resource_identifier = aws_sdk_verifiedpermissions::types::EntityIdentifier::builder()
+                .entity_type(resource_entity_type)
+                .entity_id(resource_entity_id)
+                .build()
+                .map_err(|e| {
+                    error!("Failed to build resource entity identifier: {}", e);
+                    Status::internal("Failed to build resource entity identifier")
+                })?;
+
+            let resource_entity_item = aws_sdk_verifiedpermissions::types::EntityItem::builder()
+                .identifier(resource_identifier)
+                .set_parents(Some(resource_parents))
+                .build();
+
+            entity_items.push(resource_entity_item);
+            debug!("Added resource entity with {} parents: {}", resource_info.parents.len(), resource_entity_id);
+        }
+
+        let entities_def = aws_sdk_verifiedpermissions::types::EntitiesDefinition::EntityList(entity_items);
+
+        debug!("Built entities definition with {} entities", entities_def.as_entity_list().map(|e| e.len()).unwrap_or(0));
+        Ok(Some(entities_def))
     }
 }
 
@@ -690,12 +771,11 @@ impl Authorization for AvpAuthorizationService {
             }
         };
 
-        debug!("Parsed path '{}' to: resource_type={}, resource_id={:?}, parent_type={:?}, parent_id={:?}",
+        debug!("Parsed path '{}' to: resource_type={}, resource_id={:?}, parents={:?}",
             path,
             resource_info.resource_type,
             resource_info.resource_id,
-            resource_info.parent_type,
-            resource_info.parent_id);
+            resource_info.parents);
         
         // Map HTTP method to Cedar action
         let action = resource_mapper.map_method_to_action(&method, &path, &resource_info);
@@ -756,12 +836,17 @@ async fn main() -> Result<()> {
                                 .map(|(k, v)| (k.as_str(), v.as_str()))
                                 .collect();
 
+                            // Convert parents from config format to internal format
+                            let parents: Vec<(String, String)> = pattern.parents
+                                .as_ref()
+                                .map(|p| p.iter().map(|parent| (parent.parent_type.clone(), parent.parent_id.clone())).collect())
+                                .unwrap_or_else(Vec::new);
+
                             if let Err(e) = mapper.add_pattern(
                                 &pattern.pattern,
                                 &pattern.resource_type,
-                                pattern.resource_id_group.as_deref(),
-                                pattern.parent_type.as_deref(),
-                                pattern.parent_id_group.as_deref(),
+                                pattern.resource_id.as_deref(),
+                                parents,
                                 str_params,
                             ) {
                                 error!("Failed to add pattern '{}': {}", pattern.pattern, e);

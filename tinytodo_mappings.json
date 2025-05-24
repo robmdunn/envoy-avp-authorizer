@@ -1,0 +1,114 @@
+{
+  "patterns": [
+    {
+      "pattern": "app",
+      "resource_type": "TinyTodo::Application",
+      "resource_id": "app",
+      "parents": [],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "app/shared",
+      "resource_type": "TinyTodo::Application",
+      "resource_id": "app",
+      "parents": [],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "app/lists",
+      "resource_type": "TinyTodo::Application",
+      "resource_id": "app",
+      "parents": [],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "lists",
+      "resource_type": "TinyTodo::List",
+      "resource_id": null,
+      "parents": [],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "lists/{id}",
+      "resource_type": "TinyTodo::List",
+      "resource_id": "${id}",
+      "parents": [],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "lists/{listId}/tasks",
+      "resource_type": "TinyTodo::Task",
+      "resource_id": null,
+      "parents": [
+        {
+          "parent_type": "TinyTodo::List",
+          "parent_id": "${listId}"
+        }
+      ],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "lists/{listId}/tasks/{id}",
+      "resource_type": "TinyTodo::Task",
+      "resource_id": "${id}",
+      "parents": [
+        {
+          "parent_type": "TinyTodo::List",
+          "parent_id": "${listId}"
+        }
+      ],
+      "parameter_groups": {}
+    }
+  ],
+  "action_mappings": [
+    {
+      "path_pattern": "app",
+      "mappings": {
+        "GET": "TinyTodo::Action::ListLists"
+      }
+    },
+    {
+      "path_pattern": "app/shared",
+      "mappings": {
+        "GET": "TinyTodo::Action::ListSharedLists"
+      }
+    },
+    {
+      "path_pattern": "app/lists",
+      "mappings": {
+        "GET": "TinyTodo::Action::ListLists",
+        "POST": "TinyTodo::Action::CreateList"
+      }
+    },
+    {
+      "path_pattern": "lists",
+      "mappings": {
+        "GET": "TinyTodo::Action::ListLists",
+        "POST": "TinyTodo::Action::CreateList"
+      }
+    },
+    {
+      "path_pattern": "lists/{id}",
+      "mappings": {
+        "GET": "TinyTodo::Action::GetList",
+        "PUT": "TinyTodo::Action::UpdateList",
+        "DELETE": "TinyTodo::Action::DeleteList"
+      }
+    },
+    {
+      "path_pattern": "lists/{listId}/tasks",
+      "mappings": {
+        "GET": "TinyTodo::Action::ListTasks",
+        "POST": "TinyTodo::Action::CreateTask"
+      }
+    },
+    {
+      "path_pattern": "lists/{listId}/tasks/{id}",
+      "mappings": {
+        "GET": "TinyTodo::Action::GetTask",
+        "PUT": "TinyTodo::Action::UpdateTask",
+        "DELETE": "TinyTodo::Action::DeleteTask"
+      }
+    }
+  ]
+}

@@ -49,26 +49,23 @@ pub enum ResourceMappingError {
 pub struct ResourcePath {
     pub resource_type: String,
     pub resource_id: Option<String>,
-    pub parent_type: Option<String>,
-    pub parent_id: Option<String>,
+    pub parents: Vec<Parent>,
     pub parameters: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parent {
+    pub parent_type: String,
+    pub parent_id: String,
 }
 
 impl ResourcePath {
     pub fn to_entity_uid(&self) -> String {
-        let result = match (&self.resource_id, &self.parent_type, &self.parent_id) {
-            // Resource with ID, with parent
-            (Some(id), Some(parent_type), Some(parent_id)) => {
-                format!("{}::{parent_type}::{parent_id}::{}", self.resource_type, id)
-            },
-            // Resource with ID, no parent
-            (Some(id), _, _) => {
+        let result = match &self.resource_id {
+            Some(id) => {
                 format!("{}::{}", self.resource_type, id)
             },
-            (None, Some(parent_type), Some(parent_id)) => {
-                format!("{}::{parent_type}::{parent_id}", self.resource_type)
-            },
-            _ => {
+            None => {
                 self.resource_type.clone()
             }
         };
@@ -83,9 +80,8 @@ struct ResourcePattern {
     pattern: String,
     regex: Regex,
     resource_type: FieldValue,
-    resource_id_group: Option<String>,
-    parent_type: Option<FieldValue>,
-    parent_id_group: Option<String>,
+    resource_id: Option<String>,
+    parents: Vec<(String, String)>,
     parameter_groups: HashMap<String, String>,
 }
 
@@ -140,9 +136,8 @@ impl ResourceMapper {
     // Pattern information helper method
     pub fn get_patterns_info(&self) -> Vec<String> {
         self.patterns.iter()
-            .map(|p| format!("'{}' -> type: '{}', id_group: {:?}, parent: {:?}/{:?}", 
-                            p.pattern, p.resource_type, p.resource_id_group, 
-                            p.parent_type.as_ref().map(|pt| pt.to_string()), p.parent_id_group))
+            .map(|p| format!("'{}' -> type: '{}', resource_id: {:?}, parents: {:?}", 
+                            p.pattern, p.resource_type, p.resource_id, p.parents))
             .collect()
     }
 
@@ -151,9 +146,8 @@ impl ResourceMapper {
         &mut self,
         pattern: &str,
         resource_type: &str,
-        resource_id_group: Option<&str>,
-        parent_type: Option<&str>,
-        parent_id_group: Option<&str>,
+        resource_id: Option<&str>,
+        parents: Vec<(String, String)>, // Vec of (parent_type, parent_id) pairs
         parameter_groups: HashMap<&str, &str>,
     ) -> Result<(), ResourceMappingError> {
         // Convert the pattern to a regex pattern
@@ -171,21 +165,16 @@ impl ResourceMapper {
         // Parse resource_type as FieldValue
         let resource_type_value = FieldValue::from_str(resource_type)?;
             
-        // Parse parent_type as FieldValue if provided
-        let parent_type_value = if let Some(pt) = parent_type {
-            Some(FieldValue::from_str(pt)?)
-        } else {
-            None
-        };
+        // Convert parents vector to owned strings
+        let parents_owned: Vec<(String, String)> = parents.into_iter().collect();
             
         // Add the pattern
         self.patterns.push(ResourcePattern {
             pattern: pattern.to_string(),
             regex,
             resource_type: resource_type_value,
-            resource_id_group: resource_id_group.map(ToString::to_string),
-            parent_type: parent_type_value,
-            parent_id_group: parent_id_group.map(ToString::to_string),
+            resource_id: resource_id.map(ToString::to_string),
+            parents: parents_owned,
             parameter_groups,
         });
         
@@ -292,51 +281,60 @@ impl ResourceMapper {
                 format!("Failed to capture groups from path: {}", clean_path)
             ))?;
             
-        // Extract resource type (always present)
+        // Build capture map for substitution using named groups
+        let mut capture_map = HashMap::new();
+        for (i, name) in pattern.regex.capture_names().enumerate() {
+            if let Some(group_name) = name {
+                if let Some(matched) = captures.get(i) {
+                    capture_map.insert(group_name.to_string(), matched.as_str().to_string());
+                    trace!("Captured: {} = {}", group_name, matched.as_str());
+                }
+            }
+        }
+
+        // Extract resource type with substitution
         let resource_type = match &pattern.resource_type {
-            FieldValue::Literal(literal_value) => literal_value.clone(),
+            FieldValue::Literal(literal_value) => {
+                substitute_variables(literal_value, &capture_map)
+                    .unwrap_or_else(|_| literal_value.clone())
+            },
             FieldValue::CaptureGroup(capture_name) => {
-                // Use the captured value from the URL
-                captures.name(capture_name)
-                    .map(|m| m.as_str().to_string())
+                capture_map.get(capture_name)
+                    .cloned()
                     .unwrap_or_else(|| {
                         trace!("Capture group '{}' not found, using empty string", capture_name);
                         String::new()
                     })
             }
         };
-        
-        // Extract resource ID if present in the pattern
-        let resource_id = if pattern.resource_id_group.as_ref().is_some_and(|g| g == "resource") && 
-                        captures.name("id").is_some() {
-            // Special case for {parent}/{parentId}/{resource}/{id} pattern
-            // Use the "id" group as the resource ID instead of the "resource" group
-            captures.name("id").map(|m| m.as_str().to_string())
-        } else {
-            pattern.resource_id_group.as_ref().and_then(|group| {
-                let id = captures.name(group).map(|m| m.as_str().to_string());
-                trace!("Extracted resource_id: {:?} from group: {:?}", id, group);
-                id
-            })
-        };
-        
-        // Extract parent type if present in the pattern
-        let parent_type = match &pattern.parent_type {
-            Some(FieldValue::Literal(literal_value)) => Some(literal_value.clone()),
-            Some(FieldValue::CaptureGroup(capture_name)) => {
-                // Use the captured value from the URL
-                captures.name(capture_name)
-                    .map(|m| m.as_str().to_string())
-            },
-            None => None,
-        };
-        
-        // Extract parent ID if present in the pattern
-        let parent_id = pattern.parent_id_group.as_ref().and_then(|group| {
-            let id = captures.name(group).map(|m| m.as_str().to_string());
-            trace!("Extracted parent_id: {:?} from group: {:?}", id, group);
-            id
+
+        // Extract resource ID with substitution
+        let resource_id = pattern.resource_id.as_ref().and_then(|template| {
+            let substituted = substitute_variables(template, &capture_map)
+                .unwrap_or_else(|_| template.clone());
+            if substituted.is_empty() {
+                None
+            } else {
+                Some(substituted)
+            }
         });
+
+        // Extract parents with substitution
+        let mut parents = Vec::new();
+        for (parent_type_template, parent_id_template) in &pattern.parents {
+            let parent_type = substitute_variables(parent_type_template, &capture_map)
+                .unwrap_or_else(|_| parent_type_template.clone());
+            let parent_id = substitute_variables(parent_id_template, &capture_map)
+                .unwrap_or_else(|_| parent_id_template.clone());
+            
+            if !parent_type.is_empty() && !parent_id.is_empty() {
+                trace!("Adding parent: {} = {}", parent_type, parent_id);
+                parents.push(Parent {
+                    parent_type,
+                    parent_id,
+                });
+            }
+        }
         
         // Extract additional parameters
         let mut parameters = HashMap::new();
@@ -353,8 +351,7 @@ impl ResourceMapper {
         Ok(ResourcePath {
             resource_type,
             resource_id,
-            parent_type,
-            parent_id,
+            parents,
             parameters,
         })
     }
@@ -370,8 +367,7 @@ impl ResourceMapper {
                 Ok(ResourcePath {
                     resource_type: segments[0].to_string(),
                     resource_id: None,
-                    parent_type: None,
-                    parent_id: None,
+                    parents: Vec::new(),
                     parameters: HashMap::new(),
                 })
             },
@@ -380,8 +376,7 @@ impl ResourceMapper {
                 Ok(ResourcePath {
                     resource_type: segments[0].to_string(),
                     resource_id: Some(segments[1].to_string()),
-                    parent_type: None,
-                    parent_id: None,
+                    parents: Vec::new(),
                     parameters: HashMap::new(),
                 })
             },
@@ -390,8 +385,10 @@ impl ResourceMapper {
                 Ok(ResourcePath {
                     resource_type: segments[2].to_string(),
                     resource_id: None,
-                    parent_type: Some(segments[0].to_string()),
-                    parent_id: Some(segments[1].to_string()),
+                    parents: vec![Parent {
+                        parent_type: segments[0].to_string(),
+                        parent_id: segments[1].to_string(),
+                    }],
                     parameters: HashMap::new(),
                 })
             },
@@ -400,8 +397,10 @@ impl ResourceMapper {
                 Ok(ResourcePath {
                     resource_type: segments[2].to_string(),
                     resource_id: Some(segments[3].to_string()),
-                    parent_type: Some(segments[0].to_string()),
-                    parent_id: Some(segments[1].to_string()),
+                    parents: vec![Parent {
+                        parent_type: segments[0].to_string(),
+                        parent_id: segments[1].to_string(),
+                    }],
                     parameters: HashMap::new(),
                 })
             },
@@ -462,6 +461,29 @@ impl ResourceMapper {
     }
 }
 
+// Substitute ${variable} patterns in a string with values from capture groups
+fn substitute_variables(template: &str, captures: &HashMap<String, String>) -> Result<String, ResourceMappingError> {
+    let var_regex = Regex::new(r"\$\{([^}]+)\}")
+        .map_err(|e| ResourceMappingError::InvalidPathFormat(format!("Invalid substitution regex: {}", e)))?;
+    
+    let mut result = template.to_string();
+    
+    for cap in var_regex.captures_iter(template) {
+        let full_match = cap.get(0).unwrap().as_str(); // ${variable}
+        let var_name = cap.get(1).unwrap().as_str();    // variable
+        
+        if let Some(value) = captures.get(var_name) {
+            result = result.replace(full_match, value);
+            trace!("Substituted ${{{}}}: '{}' -> '{}'", var_name, full_match, value);
+        } else {
+            trace!("Variable '{}' not found in captures, leaving as literal", var_name);
+            // Don't treat missing variables as errors - just leave them as literals
+        }
+    }
+    
+    Ok(result)
+}
+
 // Default configuration for ResourceMapper
 pub fn create_default_resource_mapper(api_prefix_pattern: &str) -> ResourceMapper {
     info!("Creating default resource mapper with API prefix pattern: {}", 
@@ -471,36 +493,35 @@ pub fn create_default_resource_mapper(api_prefix_pattern: &str) -> ResourceMappe
     
     debug!("Using default patterns without API prefix for resource mappings");
     
-    // Add common REST API patterns WITHOUT the prefix using the explicit capture syntax
+    // Add common REST API patterns WITHOUT the prefix using the new substitution syntax
     let patterns = [
         // Basic collection/item pattern
-        ("{resource}", "{resource}", Some("resource"), None, None, HashMap::new()),
-        ("{resource}/{id}", "{resource}", Some("id"), None, None, HashMap::new()),
+        ("{resource}", "${resource}", None, Vec::new()),
+        ("{resource}/{id}", "${resource}", Some("${id}"), Vec::new()),
             
         // User-specific resources
-        ("users/{userId}/{resource}", "{resource}", Some("resource"), 
-            Some("User"), Some("userId"), HashMap::new()),
-        ("users/{userId}/{resource}/{id}", "{resource}", Some("id"), 
-            Some("User"), Some("userId"), HashMap::new()),
+        ("users/{userId}/{resource}", "${resource}", None, 
+            vec![("User".to_string(), "${userId}".to_string())]),
+        ("users/{userId}/{resource}/{id}", "${resource}", Some("${id}"), 
+            vec![("User".to_string(), "${userId}".to_string())]),
 
         // Nested resources
-        ("{parent}/{parentId}/{resource}", "{resource}", Some("resource"), 
-            Some("{parent}"), Some("parentId"), HashMap::new()),
-        ("{parent}/{parentId}/{resource}/{id}", "{resource}", Some("id"), 
-            Some("{parent}"), Some("parentId"), HashMap::new()),
+        ("{parent}/{parentId}/{resource}", "${resource}", None, 
+            vec![("${parent}".to_string(), "${parentId}".to_string())]),
+        ("{parent}/{parentId}/{resource}/{id}", "${resource}", Some("${id}"), 
+            vec![("${parent}".to_string(), "${parentId}".to_string())]),
     ];
-    
+
     // Add each pattern
-    for (pattern, resource_type, resource_id_group, parent_type, parent_id_group, params) in patterns {
+    for (pattern, resource_type, resource_id, parents) in patterns {
         debug!("Adding default pattern: '{}'", pattern);
         
         if let Err(e) = mapper.add_pattern(
             pattern, 
             resource_type, 
-            resource_id_group, 
-            parent_type, 
-            parent_id_group, 
-            params,
+            resource_id, 
+            parents, 
+            HashMap::new(), // Empty parameter_groups
         ) {
             warn!("Failed to add default pattern '{}': {}", pattern, e);
         }

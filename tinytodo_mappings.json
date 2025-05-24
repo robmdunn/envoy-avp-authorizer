@@ -58,6 +58,40 @@
         }
       ],
       "parameter_groups": {}
+    },
+    {
+      "pattern": "app/{appId}/lists/{listId}/tasks/{id}",
+      "resource_type": "TinyTodo::Task",
+      "resource_id": "${id}",
+      "parents": [
+        {
+          "parent_type": "TinyTodo::List",
+          "parent_id": "${listId}"
+        },
+        {
+          "parent_type": "TinyTodo::Application",
+          "parent_id": "${appId}"
+        }
+      ],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "app/{appId}/lists/{listId}/tasks/{id}/versions/{versionId}",
+      "resource_type": "TinyTodo::Task",
+      "resource_id": "${id}",
+      "parents": [
+        {
+          "parent_type": "TinyTodo::List",
+          "parent_id": "${listId}"
+        },
+        {
+          "parent_type": "TinyTodo::Application",
+          "parent_id": "${appId}"
+        }
+      ],
+      "parameter_groups": {
+        "version": "versionId"
+      }
     }
   ],
   "action_mappings": [
@@ -104,6 +138,22 @@
     },
     {
       "path_pattern": "lists/{listId}/tasks/{id}",
+      "mappings": {
+        "GET": "TinyTodo::Action::GetTask",
+        "PUT": "TinyTodo::Action::UpdateTask",
+        "DELETE": "TinyTodo::Action::DeleteTask"
+      }
+    },
+    {
+      "path_pattern": "app/{appId}/lists/{listId}/tasks/{id}",
+      "mappings": {
+        "GET": "TinyTodo::Action::GetTask",
+        "PUT": "TinyTodo::Action::UpdateTask",
+        "DELETE": "TinyTodo::Action::DeleteTask"
+      }
+    },
+    {
+      "path_pattern": "app/{appId}/lists/{listId}/tasks/{id}/versions/{versionId}",
       "mappings": {
         "GET": "TinyTodo::Action::GetTask",
         "PUT": "TinyTodo::Action::UpdateTask",

@@ -41,11 +41,9 @@ impl Telemetry {
     }
 
     // Start timing a request and return a guard that will record the duration when dropped
-    pub fn time_check_request(method: &str, path: &str) -> RequestTimer {
+    pub fn time_check_request() -> RequestTimer {
         RequestTimer {
             start: Instant::now(),
-            method: method.to_string(),
-            path: path.to_string(),
         }
     }
 
@@ -99,17 +97,13 @@ impl Telemetry {
 // Timer guard for request duration
 pub struct RequestTimer {
     start: Instant,
-    method: String,
-    path: String,
 }
 
 impl Drop for RequestTimer {
     fn drop(&mut self) {
         let duration = self.start.elapsed();
         histogram!(
-            METRIC_CHECK_REQUEST_DURATION_SECONDS,
-            "method" => self.method.clone(),
-            "path" => self.path.clone()
+            METRIC_CHECK_REQUEST_DURATION_SECONDS
         ).record(duration.as_secs_f64());
     }
 }

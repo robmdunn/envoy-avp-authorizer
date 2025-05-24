@@ -19,6 +19,7 @@ pub struct ResourcePath {
     pub resource_id: Option<String>,
     pub parents: Vec<Parent>,
     pub parameters: HashMap<String, String>,
+    pub matched_pattern: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -294,6 +295,7 @@ impl ResourceMapper {
             resource_id,
             parents,
             parameters,
+            matched_pattern: pattern.pattern.clone(),
         };
 
         // Consistent resource logging
@@ -320,48 +322,52 @@ impl ResourceMapper {
         let segments: Vec<&str> = path.split('/').collect();
         
         match segments.len() {
-            // /resources
-            1 => {
-                Ok(ResourcePath {
-                    resource_type: segments[0].to_string(),
-                    resource_id: None,
-                    parents: Vec::new(),
-                    parameters: HashMap::new(),
-                })
-            },
-            // /resources/{id}
-            2 => {
-                Ok(ResourcePath {
-                    resource_type: segments[0].to_string(),
-                    resource_id: Some(segments[1].to_string()),
-                    parents: Vec::new(),
-                    parameters: HashMap::new(),
-                })
-            },
-            // /resources/{id}/subresources
-            3 => {
-                Ok(ResourcePath {
-                    resource_type: segments[2].to_string(),
-                    resource_id: None,
-                    parents: vec![Parent {
-                        parent_type: segments[0].to_string(),
-                        parent_id: segments[1].to_string(),
-                    }],
-                    parameters: HashMap::new(),
-                })
-            },
-            // /resources/{id}/subresources/{sub_id}
-            4 => {
-                Ok(ResourcePath {
-                    resource_type: segments[2].to_string(),
-                    resource_id: Some(segments[3].to_string()),
-                    parents: vec![Parent {
-                        parent_type: segments[0].to_string(),
-                        parent_id: segments[1].to_string(),
-                    }],
-                    parameters: HashMap::new(),
-                })
-            },
+        // /resources
+        1 => {
+            Ok(ResourcePath {
+                resource_type: segments[0].to_string(),
+                resource_id: None,
+                parents: Vec::new(),
+                parameters: HashMap::new(),
+                matched_pattern: format!("default:/{}", segments[0]),
+            })
+        },
+        // /resources/{id}
+        2 => {
+            Ok(ResourcePath {
+                resource_type: segments[0].to_string(),
+                resource_id: Some(segments[1].to_string()),
+                parents: Vec::new(),
+                parameters: HashMap::new(),
+                matched_pattern: format!("default:/{}/{{id}}", segments[0]),
+            })
+        },
+        // /resources/{id}/subresources  
+        3 => {
+            Ok(ResourcePath {
+                resource_type: segments[2].to_string(),
+                resource_id: None,
+                parents: vec![Parent {
+                    parent_type: segments[0].to_string(),
+                    parent_id: segments[1].to_string(),
+                }],
+                parameters: HashMap::new(),
+                matched_pattern: format!("default:/{}/{{id}}/{}", segments[0], segments[2]),  // Add this
+            })
+        },
+        // /resources/{id}/subresources/{sub_id}
+        4 => {
+            Ok(ResourcePath {
+                resource_type: segments[2].to_string(),
+                resource_id: Some(segments[3].to_string()),
+                parents: vec![Parent {
+                    parent_type: segments[0].to_string(),
+                    parent_id: segments[1].to_string(),
+                }],
+                parameters: HashMap::new(),
+                matched_pattern: format!("default:/{}/{{id}}/{}/{{id}}", segments[0], segments[2]),  // Add this
+            })
+        },
             // Default or more complex paths
             _ => {
                 Err(ResourceMappingError::InvalidPathFormat(

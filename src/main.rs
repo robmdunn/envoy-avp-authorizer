@@ -410,7 +410,7 @@ impl AvpAuthorizationService {
                 debug!("  context_hash={}, cached=false", context_hash);
                 
                 // Record the metric
-                Telemetry::record_request(method, path, "allowed");
+                Telemetry::record_request(method, &resource_info.matched_pattern, "allowed");
                 
                 Ok(Response::new(CheckResponse::with_status(
                     Status::ok("Request authorized"),
@@ -424,7 +424,7 @@ impl AvpAuthorizationService {
                 }
                 
                 // Record the metric
-                Telemetry::record_request(method, path, "denied");
+                Telemetry::record_request(method, &resource_info.matched_pattern, "denied");
                 
                 // Get diagnostics for better error messages
                 let message = if let Some(diag) = diagnostics {
@@ -689,6 +689,9 @@ impl Authorization for AvpAuthorizationService {
         &self,
         request: Request<CheckRequest>,
     ) -> Result<Response<CheckResponse>, Status> {
+        // Start timing the request
+        let _request_timer = Telemetry::time_check_request();
+
         // Extract the request and decode the attributes (keep this part)
         let check_request = request.into_inner();
         
@@ -725,9 +728,6 @@ impl Authorization for AvpAuthorizationService {
         let method = http.method.clone();
 
         trace!("Authorization request received: method={}, path={}", method, path);
-        
-        // Start timing the request
-        let _request_timer = Telemetry::time_check_request(&method, &path);
         
         // Parse query parameters
         let query_params = parse_query_params(&path);
@@ -802,7 +802,7 @@ impl Authorization for AvpAuthorizationService {
             resource_info.resource_type,
             resource_info.resource_id,
             resource_info.parents);
-        
+
         // Map HTTP method to Cedar action
         let action = resource_mapper.map_method_to_action(&method, &path, &resource_info);
         

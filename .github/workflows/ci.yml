@@ -90,7 +90,6 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./Dockerfile.github
           platforms: linux/amd64
           push: false
           cache-from: type=gha

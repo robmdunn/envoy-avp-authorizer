@@ -1,11 +1,7 @@
-# Rust build artifacts (not needed since we use pre-built binaries)
+# Build artifacts
 target/
 **/*.rs.bk
 *.pdb
-src/
-Cargo.toml
-Cargo.lock
-Cross.toml
 
 # IDE files
 .vscode/
@@ -26,10 +22,6 @@ Thumbs.db
 .git/
 .gitignore
 
-# Docker
-Dockerfile*
-.dockerignore
-
 # Documentation and examples
 README.md
 docs/
@@ -39,13 +31,10 @@ examples/
 tests/
 benches/
 
-# CI/CD (except binaries folder)
+# CI/CD
 .github/
 .gitlab-ci.yml
 .travis.yml
 
 # Logs
 *.log
-
-# Keep the binaries folder
-!binaries/

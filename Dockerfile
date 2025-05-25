@@ -8,8 +8,19 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY . .
+# Copy dependency files first for better layer caching
+COPY Cargo.toml Cargo.lock ./
 
+# Create a dummy main.rs to build dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs
+
+# Build dependencies only (this layer will be cached unless dependencies change)
+RUN cargo build --release && rm src/main.rs
+
+# Copy the actual source code
+COPY src ./src
+
+# Build the application (only application code compilation, dependencies are cached)
 RUN cargo build --release
 
 # Create a smaller runtime image

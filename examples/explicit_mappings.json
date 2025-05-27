@@ -1,0 +1,185 @@
+{
+  "patterns": [
+    {
+      "pattern": "{resource}",
+      "resource_type": "${resource}",
+      "resource_id": null,
+      "parents": [],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "{resource}/{id}",
+      "resource_type": "${resource}",
+      "resource_id": "${id}",
+      "parents": [],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "program/{programId}/documents",
+      "resource_type": "documents",
+      "resource_id": null,
+      "parents": [
+        {
+          "parent_type": "program",
+          "parent_id": "${programId}"
+        }
+      ],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "program/{programId}/documents/{id}",
+      "resource_type": "documents",
+      "resource_id": "${id}",
+      "parents": [
+        {
+          "parent_type": "program",
+          "parent_id": "${programId}"
+        }
+      ],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "{parent}/{parentId}/{resource}",
+      "resource_type": "${resource}",
+      "resource_id": null,
+      "parents": [
+        {
+          "parent_type": "${parent}",
+          "parent_id": "${parentId}"
+        }
+      ],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "{parent}/{parentId}/{resource}/{id}",
+      "resource_type": "${resource}",
+      "resource_id": "${id}",
+      "parents": [
+        {
+          "parent_type": "${parent}",
+          "parent_id": "${parentId}"
+        }
+      ],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "users/{userId}/{resource}",
+      "resource_type": "${resource}",
+      "resource_id": null,
+      "parents": [
+        {
+          "parent_type": "User",
+          "parent_id": "${userId}"
+        }
+      ],
+      "parameter_groups": {}
+    },
+    {
+      "pattern": "users/{userId}/{resource}/{id}",
+      "resource_type": "${resource}",
+      "resource_id": "${id}",
+      "parents": [
+        {
+          "parent_type": "User",
+          "parent_id": "${userId}"
+        }
+      ],
+      "parameter_groups": {}
+    }
+  ],
+  "action_mappings": [
+    {
+      "path_pattern": "{resource}/batch",
+      "mappings": {
+        "POST": "batch_create",
+        "PUT": "batch_update",
+        "DELETE": "batch_delete"
+      }
+    },
+    {
+      "path_pattern": "{parent}/{parentId}/{resource}/batch",
+      "mappings": {
+        "POST": "batch_create",
+        "PUT": "batch_update",
+        "DELETE": "batch_delete"
+      }
+    },
+    {
+      "path_pattern": "{resource}/{id}/publish",
+      "mappings": {
+        "POST": "publish"
+      }
+    },
+    {
+      "path_pattern": "{resource}/{id}/unpublish",
+      "mappings": {
+        "POST": "unpublish"
+      }
+    },
+    {
+      "path_pattern": "{resource}/{id}/archive",
+      "mappings": {
+        "POST": "archive"
+      }
+    },
+    {
+      "path_pattern": "{resource}",
+      "mappings": {
+        "GET": "read",
+        "POST": "create",
+        "PUT": "update",
+        "DELETE": "delete",
+        "PATCH": "patch",
+        "HEAD": "read_metadata",
+        "OPTIONS": "get_permissions"
+      }
+    },
+    {
+      "path_pattern": "{resource}/{id}",
+      "mappings": {
+        "GET": "read",
+        "POST": "create",
+        "PUT": "update",
+        "DELETE": "delete",
+        "PATCH": "patch",
+        "HEAD": "read_metadata",
+        "OPTIONS": "get_permissions"
+      }
+    },
+    {
+      "path_pattern": "{parent}/{parentId}/{resource}",
+      "mappings": {
+        "GET": "read",
+        "POST": "create",
+        "PUT": "update",
+        "DELETE": "delete",
+        "PATCH": "patch"
+      }
+    },
+    {
+      "path_pattern": "{parent}/{parentId}/{resource}/{id}",
+      "mappings": {
+        "GET": "read",
+        "POST": "create",
+        "PUT": "update",
+        "DELETE": "delete",
+        "PATCH": "patch"
+      }
+    },
+    {
+      "path_pattern": "program/{programId}/documents",
+      "mappings": {
+        "GET": "read",
+        "POST": "create"
+      }
+    },
+    {
+      "path_pattern": "program/{programId}/documents/{id}",
+      "mappings": {
+        "GET": "read",
+        "PUT": "update",
+        "DELETE": "delete"
+      }
+    }
+  ]
+}

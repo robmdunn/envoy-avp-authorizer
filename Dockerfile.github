@@ -1,0 +1,46 @@
+# Stage 1: Select the correct binary for the target platform
+FROM --platform=$BUILDPLATFORM busybox AS binary-selector
+
+ARG TARGETPLATFORM
+
+# Copy all binaries
+COPY binaries/ /binaries/
+
+# Select the correct binary based on target platform
+RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+        cp /binaries/envoy-avp-authorizer-linux-x86_64 /envoy-avp-authorizer; \
+    elif [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        cp /binaries/envoy-avp-authorizer-linux-aarch64 /envoy-avp-authorizer; \
+    else \
+        echo "Unsupported platform: $TARGETPLATFORM" && exit 1; \
+    fi && \
+    chmod +x /envoy-avp-authorizer
+
+# Stage 2: Create the final runtime image
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user
+RUN useradd -m avpuser
+
+# Copy the selected binary from the binary-selector stage
+COPY --from=binary-selector /envoy-avp-authorizer /envoy-avp-authorizer
+
+# Switch to non-root user
+USER avpuser
+WORKDIR /
+
+# Expose the port the service will run on
+EXPOSE 50051
+EXPOSE 9000
+
+# Command to run the executable
+ENTRYPOINT ["/envoy-avp-authorizer"]
+
+# Default arguments if none are provided
+CMD ["--help"]

@@ -307,6 +307,10 @@ static_resources:
                 port_value: 8080
 ```
 
+### Istio Deployment
+
+See: [Istio Deployment Example](examples/istio/istio.md)
+
 ## Monitoring
 
 ### Metrics

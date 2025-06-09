@@ -12,7 +12,7 @@ categories = ["authentication", "web-programming"]
 anyhow = "1.0"
 async-trait = "0.1"
 aws-config = { version = "1.6", default-features = false, features = ["rustls", "rt-tokio", "credentials-process"] }
-aws-sdk-verifiedpermissions = { version = "1.79", default-features = false, features = ["rustls", "rt-tokio"] }
+aws-sdk-verifiedpermissions = { version = "1.81", default-features = false, features = ["rustls", "rt-tokio"] }
 aws-types = "1.3"
 clap = { version = "4.5", features = ["derive", "env"] }
 envoy-types = "0.6"

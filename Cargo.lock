@@ -226,9 +226,9 @@ dependencies = [
 
 [[package]]
 name = "aws-sdk-verifiedpermissions"
-version = "1.80.0"
+version = "1.81.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e41d56834e13738958a52766da619a091b9b85d6da2f51e1a466fe46df76e7a6"
+checksum = "ca598311725b9207188cf5e157dcf94709540c60e35d987e7acd600603858650"
 dependencies = [
  "aws-credential-types",
  "aws-runtime",

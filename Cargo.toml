@@ -15,7 +15,7 @@ aws-config = { version = "1.6", default-features = false, features = ["rustls", 
 aws-sdk-verifiedpermissions = { version = "1.79", default-features = false, features = ["rustls", "rt-tokio"] }
 aws-types = "1.3"
 clap = { version = "4.5", features = ["derive", "env"] }
-envoy-types = "0.6"
+envoy-types = "0.7"
 futures = "0.3"
 futures-channel = "0.3"
 futures-core = "0.3"

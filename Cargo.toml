@@ -33,7 +33,7 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.48", features = ["full"] }
 tonic = { version = "0.13", features = ["codegen"] }
-tonic-health = "0.13"
+tonic-health = "0.14"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 url = "2.5"

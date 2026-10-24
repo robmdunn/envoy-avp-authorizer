@@ -22,7 +22,7 @@ futures-core = "0.3"
 futures-util = "0.3"
 jsonwebtoken = { version = "9.3", default-features = false, features = ["use_pem"] }
 metrics = "0.24"
-metrics-exporter-prometheus = "0.17"
+metrics-exporter-prometheus = "0.18"
 once_cell = "1.21"
 prost = "0.14"
 regex = "1.11"

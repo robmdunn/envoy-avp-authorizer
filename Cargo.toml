@@ -1,6 +1,6 @@
 [package]
 name = "envoy-avp-authorizer"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Envoy external authorization service using Amazon Verified Permissions"
 license = "MIT"

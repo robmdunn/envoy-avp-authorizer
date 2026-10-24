@@ -1,0 +1,21 @@
+# Categories for GitHub's auto-generated release notes
+changelog:
+  categories:
+    - title: Features
+      labels:
+        - enhancement
+    - title: Bug Fixes
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Rust Dependencies
+      labels:
+        - rust
+    - title: GitHub Actions
+      labels:
+        - github-actions
+    - title: Other Changes
+      labels:
+        - "*"

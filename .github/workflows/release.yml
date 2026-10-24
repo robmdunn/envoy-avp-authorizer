@@ -147,7 +147,7 @@ jobs:
       - name: Generate release notes
         id: release_notes
         run: |
-          echo "## Changes" >> release_notes.md
+          echo "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/CHANGELOG.md) for a summary of notable changes." >> release_notes.md
           echo "" >> release_notes.md
           echo "### Docker Images" >> release_notes.md
           echo "" >> release_notes.md
@@ -169,6 +169,8 @@ jobs:
         with:
           files: release/*
           body_path: release_notes.md
+          # Append GitHub's auto-generated PR list (categorized by .github/release.yml)
+          generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref_name, '-') }}
         env:

@@ -11,6 +11,11 @@ updates:
     labels:
       - "dependencies"
       - "rust"
+    # Batch all cargo bumps into a single PR
+    groups:
+      cargo:
+        patterns:
+          - "*"
 
   # Update GitHub Actions
   - package-ecosystem: "github-actions"
